@@ -34,20 +34,26 @@ __description__ = (
     "• следит за интерфейсом, очередями и связью с сервером\n"
     "• при ошибке другого плагина показывает окно: что случилось и что можно сделать\n"
     "• разбирает журнал: краши, исключения Python, ANR, падения прошлых запусков\n"
-    "• собирает краткий и полный отчёт для баг-репорта и отправляет его в Избранное\n\n"
+    "• по каждой найденной проблеме простыми словами пишет, что случилось, что это значит и что делать\n"
+    "• собирает полный отчёт для баг-репорта: его можно скопировать или отправить в Избранное\n\n"
     "**Приватность**\n"
     "Сообщения, номера и адреса прокси в отчёт не попадают. Наружу ничего не отправляется.\n\n"
     "**Безопасность**\n"
     "Рискованные действия (перезагрузка плагинов, деление списка пополам) работают только по вашей кнопке и включаются отдельной настройкой."
 )
 __author__ = "@Kotenok_Rwka, Claude"
-__version__ = "3.7.1"
+__version__ = "3.9.0"
 __app_version__ = ">=12.10.6"
 __sdk_version__ = ">=1.4.5.0"
 __icon__ = "OliverEmoji/21"
 __category__ = ["tools"]
 
 TICK = 5                  # период проверки, сек
+PROBE_LOST = 90           # проба без ответа дольше этого считается потерянной: шлём новую, не ждём вечно
+PROGRESS_KEYS = ("gettingDifference", "conn:Updating")   # «зависание» только если при этом нет прогресса по pts/seq
+EP_MERGE_SEC = 150        # новая заминка сразу после конца прошлой считается продолжением того же эпизода
+REPORT_GAP = 120          # автоматические отчёты не чаще, чем раз в столько секунд
+LOG_CLOCK_BACK = 300      # журнал «ушёл в прошлое» больше чем на столько секунд: часы переводили, курсор сбрасываем
 PROBE_LIMIT = 15          # очередь / UI «не отвечают» после стольких секунд
 PING_LIMIT = 25           # запрос к серверу «не отвечает» после стольких секунд
 PING_HEALTHY_EVERY = 30
@@ -61,6 +67,7 @@ ERR_INTERVALS = [30, 60, 180, 600]
 POPUP_COOLDOWN = 90         # между двумя окнами, сек
 POPUP_PLUGIN_COOLDOWN = 600 # для одного и того же плагина, сек
 ERR_RECENT = 1800
+ISSUE_TTL = [86400, 3 * 86400, 7 * 86400, 0]   # сколько хранить проблему; 0 = без ограничения
 ERR_PRIO = {"crash": 0, "ui": 1, "exit": 1, "pytrace": 2, "plugin_state": 3, "hook": 4, "plugin_log": 5}
 ERR_SERIOUS = ("crash", "ui", "exit", "pytrace", "plugin_state")
 THRESHOLDS = [15, 30, 60, 120]
@@ -74,7 +81,45 @@ LOG_LINES = 4000
 UI_BLOCK = 4              # UI-поток не отвечал столько секунд: снимаем стек
 NOTIFY_ISSUE_MIN = 10
 NOTIFY_RECENT = 1800      # уведомляем только о проблемах за последние 30 минут
+ATTR_KINDS = ("crash", "pytrace", "ui", "plugin_log", "hook")   # проблемы, у которых виновного плагина ждут по стеку
+EXC_HINTS = [   # (регулярка, ключ строки): расшифровка частых исключений простыми словами
+    (re.compile(r"ZeroDivision|divide by zero|/ by zero", re.I), "xh_zero"),
+    (re.compile(r"NullPointer|NoneType|is null|null object", re.I), "xh_null"),
+    (re.compile(r"OutOfMemory|MemoryError"), "xh_oom"),
+    (re.compile(r"StackOverflow|RecursionError|maximum recursion", re.I), "xh_stack"),
+    (re.compile(r"ConcurrentModification|changed size during iteration"), "xh_conc"),
+    (re.compile(r"NoSuchMethod|NoSuchField|ClassNotFound|NoClassDefFound|AbstractMethodError|IncompatibleClassChange|ImportError|ModuleNotFound|AttributeError|has no attribute"), "xh_compat"),
+    (re.compile(r"IndexOutOfBounds|IndexError|KeyError"), "xh_index"),
+    (re.compile(r"ClassCastException|TypeError|ValueError|NumberFormat"), "xh_type"),
+    (re.compile(r"Timeout|timed out", re.I), "xh_timeout"),
+    (re.compile(r"SecurityException|PermissionError"), "xh_perm"),
+]
 EXIT_NAMES = {3: "LOW_MEMORY", 4: "CRASH", 5: "CRASH_NATIVE", 6: "ANR", 7: "INITIALIZATION_FAILURE", 9: "EXCESSIVE_RESOURCE_USAGE"}
+_SWALLOWED = {}
+_STEM_CACHE = [0.0, {}]
+STEM_MAP = {}
+ID_RE = re.compile(r"""__id__\s*=\s*["']([^"']+)["']""")
+
+
+def _swallow(e=None):
+    """Считает ошибки, которые раньше глотались молча: место (функция:строка) -> сколько раз и последний текст."""
+    try:
+        tb = e.__traceback__ if e is not None else sys.exc_info()[2]
+        if tb is None:
+            return
+        key = f"{tb.tb_frame.f_code.co_name}:{tb.tb_lineno}"
+        row = _SWALLOWED.get(key)
+        if row is None:
+            if len(_SWALLOWED) >= 200:
+                return
+            row = _SWALLOWED[key] = [0, "", 0.0]
+        row[0] += 1
+        row[1] = f"{type(e).__name__}: {e}"[:120] if e is not None else ""
+        row[2] = time.time()
+    except Exception:
+        pass
+
+
 LOG_RE = re.compile(r"^(\d\d-\d\d \d\d:\d\d:\d\d\.\d+)\s+(\d+)\s+(\d+)\s+([VDIWEF])\s+(.+?)\s*: ?(.*)$")
 PLUGIN_PATH_RE = re.compile(r"plugins/([A-Za-z0-9_\-]+)\.(?:py|pyc|plugin)")
 
@@ -90,7 +135,7 @@ GENERIC_SEGS = {"internal", "common", "utils", "util", "core", "base", "client",
 HOOKISH_RE = re.compile(r"hook|filter|listener|handler|callback|registry", re.I)
 UPD_RE = re.compile(r"TL_update|getDifference|processUpdates", re.I)
 INTERNAL_KEYS = {"notified_keys", "ui_refresh", "stat_episodes", "stat_rescued", "recovery_pending", "recovery_log", "culprits",
-                 "plugin_snapshot", "plugin_changes", "episodes", "bisect", "popped_keys"}
+                 "plugin_snapshot", "plugin_changes", "episodes", "bisect", "popped_keys", "cleared_at", "app_ver", "app_change"}
 MC_FIELDS_RE = r"difference|updatesQueue|updatesStartWait|updatingState|lastPts|lastQts|lastSeq|lastDate|loadingDialogs|dialogsLoadedTill|getDiff"
 CM_FIELDS_RE = r"updating|connectionState|appPaused|lastKnown|currentNetwork|isNetwork|proxy"
 DEFAULT_STATE_NAMES = {1: "Connecting", 2: "WaitingForNetwork", 3: "Connected", 4: "ConnectingToProxy", 5: "Updating"}
@@ -126,7 +171,6 @@ STR = {
                   "Exact update timeline. Applies after the plugin restarts"),
     "h_diag": ("Диагностика", "Diagnostics"),
     "status": ("Состояние сейчас", "Status now"),
-    "collect": ("Собрать отчёт сейчас (около 20 с)", "Collect a report now (~20 s)"),
     "unblock": ("Разблокировать сейчас", "Unblock now"),
     "h_reports": ("Отчёты", "Reports"),
     "show": ("Показать последний отчёт", "Show latest report"),
@@ -165,8 +209,6 @@ STR = {
     "dlg_last": ("Последний отчёт", "Latest report"),
     "dlg_journal": ("Журнал событий", "Event log"),
     "copy": ("Копировать", "Copy"),
-    "full_hint": ("Полный текст: «Копировать полный отчёт» или «Отправить в Избранное».",
-                  "Full text: \"Copy full report\" or \"Send to Saved Messages\"."),
     "empty": ("Пусто", "Empty"),
     "st_off": ("Мониторинг выключен", "Monitoring is off"),
     "st_freeze": ("ЗАВИСАНИЕ: {what}", "FREEZE: {what}"),
@@ -194,8 +236,9 @@ STR = {
     "p_global": ("globalQueue", "globalQueue"),
     "p_ping": ("Запрос updates.getState к серверу", "updates.getState request to the server"),
     "pr_stuck": ("НЕ ОТВЕЧАЕТ уже {w} с", "NOT RESPONDING for {w} s"),
+    "pr_lost": ("ответ терялся {n} раз", "answer was lost {n} times"),
     "pr_wait": ("ждём ответ {w} с", "waiting for answer {w} s"),
-    "pr_none": ("ещё не проверялось", "not checked yet"),
+    "pr_notyet": ("ещё не проверялось", "not checked yet"),
     "pr_err": ("ошибка: {e}", "error: {e}"),
     "pr_off": ("выключено в настройках", "disabled in settings"),
     "c_state": ("Состояние соединения: {s}", "Connection state: {s}"),
@@ -262,7 +305,6 @@ STR = {
     "notify_issues": ("Уведомлять о проблемах", "Notify about problems"),
     "scan_now": ("Проверить систему сейчас", "Check the system now"),
     "issues": ("Обнаруженные проблемы", "Detected problems"),
-    "issues_sub": ("Найдено: {n}", "Found: {n}"),
     "scanning": ("Проверяю журнал, плагины и прошлые сбои…", "Checking the log, plugins and past crashes…"),
     "no_issues": ("Проблем не найдено", "No problems found"),
     "dlg_issues": ("Обнаруженные проблемы", "Detected problems"),
@@ -302,7 +344,6 @@ STR = {
                  "What this is: the system ran low on memory. Disable unneeded plugins or restart the app."),
     "ui_lang": ("Язык интерфейса / Interface language", "Interface language / Язык интерфейса"),
     "sec_errors": ("Ошибки плагинов", "Plugin errors"),
-    "sec_errors_sub": ("Окно с вариантами, быстрая проверка, список игнорируемых", "Popup with options, fast check, ignore list"),
     "h_errors": ("Слежение за ошибками", "Error tracking"),
     "err_watch": ("Следить за ошибками плагинов", "Watch plugins for errors"),
     "err_watch_sub": ("Читает журнал приложения и состояние плагинов, находит ошибки и называет плагин", "Reads the app log and plugin states, finds errors and names the plugin"),
@@ -322,8 +363,6 @@ STR = {
     "track_changes": ("Следить за установкой и обновлением плагинов", "Track plugin installs and updates"),
     "env_check": ("Проверять устройство (память, место, режим экономии)", "Check the device (memory, storage, power saving)"),
     "scan_exits": ("Разбирать причины прошлых завершений приложения", "Analyse past app exits"),
-    "ep_title": ("Ошибка в плагине «{who}»", "Error in plugin “{who}”"),
-    "ep_title_test": ("Пример: ошибка в плагине «{who}»", "Sample: error in plugin “{who}”"),
     "ep_disable": ("Отключить «{who}»", "Disable “{who}”"),
     "ep_more": ("Ещё…", "More…"),
     "ep_disabled": ("Плагин «{who}» отключён", "Plugin “{who}” was disabled"),
@@ -372,6 +411,12 @@ STR = {
     "cpu_warn": ("Предупреждать о нагрузке на CPU", "Warn about CPU load"),
     "cpu_warn_sub": ("Только если нагрузку создаёт названный плагин. Системные потоки (отрисовка, кэш) не считаются. Данные о нагрузке остаются в полном отчёте",
                      "Only when a named plugin causes the load. System threads (rendering, cache) do not count. Load data stays in the full report"),
+    "issue_ttl": ("Забывать проблемы старше", "Forget problems older than"),
+    "hide_lowmem": ("Не показывать закрытие в фоне из-за нехватки памяти", "Hide background closes caused by low memory"),
+    "hide_lowmem_sub": ("Так Android обычно чистит память у свёрнутых приложений, это не сбой. Закрытия на экране всё равно покажутся",
+                        "That is how Android normally frees memory from background apps, not a failure. Closes while on screen are still shown"),
+    "clr_issues_sub": ("Удалит список. Старые события из журнала и истории Android обратно не вернутся",
+                       "Clears the list. Old events from the log and Android history will not come back"),
     "clr_issues": ("Очистить список проблем", "Clear the problem list"),
     "st_issues": (" · проблем: {n}", " · problems: {n}"),
     "st_last": (" · последнее зависание {d} назад", " · last freeze {d} ago"),
@@ -380,6 +425,7 @@ STR = {
     "e_part_dead": ("часть «{n}» отключена после повторных сбоев до перезапуска плагина", "part \"{n}\" switched off after repeated failures until the plugin restarts"),
     "s_self": ("СТОИМОСТЬ САМОГО ПЛАГИНА", "COST OF THE PLUGIN ITSELF"),
     "sc_cpu": ("CPU: около {p}% в среднем за {n} мин (потоки меньше 0,3% не видны)", "CPU: about {p}% on average over {n} min (threads under 0.3% are not visible)"),
+    "sc_swallow": ("Тихо перехваченные внутренние ошибки: {n} (мест: {k}; часть из них ожидаема при чтении полей Java)", "Silently caught internal errors: {n} ({k} places; some are expected when probing Java fields)"),
     "sc_threads": ("Потоков плагина сейчас: {n}", "Plugin threads now: {n}"),
     "sc_disk": ("Файлы на диске: {k} КБ в {n} файлах", "Files on disk: {k} KB in {n} files"),
     "sc_state": ("Сохранённое состояние в настройках: {k} КБ", "Saved state in settings: {k} KB"),
@@ -435,17 +481,14 @@ STR = {
     "pv_copy": ("Копировать", "Copy"),
     "pv_close": ("Закрыть", "Close"),
     "bn_btn": ("Пакет для баг-репорта", "Bug report bundle"),
-    "bn_sub": ("Один файл: вердикт, окружение, история, изменения плагинов, самопроверка, дамп и журнал. Перед отправкой можно просмотреть", "One file: verdict, environment, history, plugin changes, self-check, dump and log. You can review it before sending"),
     "bn_building": ("Собираю пакет…", "Building the bundle…"),
     "h_sections": ("Разделы", "Sections"),
     "sec_monitor": ("Мониторинг и сеть", "Monitoring and network"),
     "sec_monitor_sub": ("Что и как проверять, пороги, лаги интерфейса, замер операций", "What to check and how, thresholds, UI freezes, operation timing"),
-    "sec_recover": ("Восстановление и проверки", "Recovery and tests"),
     "sec_recover_sub": ("Перезагрузка, деление пополам, проверка потери сети", "Reload, bisecting, network loss test"),
     "sec_health": ("Здоровье системы", "System health"),
     "sec_health_sub": ("Проблемы, самопроверка, изменения плагинов", "Problems, self-check, plugin changes"),
     "sec_reports": ("Отчёты и история", "Reports and history"),
-    "sec_reports_sub": ("Отчёты, пакет для баг-репорта, история зависаний, дамп", "Reports, bug report bundle, freeze history, dump"),
     "sec_more": ("Дополнительно", "More"),
     "sec_more_sub": ("Стоимость плагина, перенос настроек", "Cost of the plugin, settings transfer"),
     "flat": ("Все настройки одной страницей", "All settings on one page"),
@@ -654,6 +697,23 @@ STR = {
     "e_unloaded": ("плагин выгружен", "plugin unloaded"),
     "e_sleep": ("устройство спало или сторож был заморожен ({lag} с), счётчики сброшены", "device slept or the watchdog was frozen ({lag} s), counters reset"),
     "e_freeze": ("ЗАВИСАНИЕ: {x}", "FREEZE: {x}"),
+    "e_freeze_again": ("ЗАВИСАНИЕ вернулось (тот же эпизод): {x}", "FREEZE is back (same episode): {x}"),
+    "e_log_clock": ("время в журнале ушло назад на {d}: курсор журнала сброшен", "log time went back by {d}: log cursor reset"),
+    "logchk_btn": ("Проверить чтение журнала", "Check log reading"),
+    "logchk_btn_sub": ("Пишет тестовые строки и проверяет, что плагин находит их в logcat и разбирает", "Writes test lines and checks that the plugin finds and parses them from logcat"),
+    "logchk_busy": ("Проверка идёт…", "Checking…"),
+    "logchk_title": ("Проверка журнала", "Log check"),
+    "e_app_changed": ("версия приложения изменилась: {a} → {b}", "app version changed: {a} → {b}"),
+    "app_chg_line": ("Версия приложения изменилась {t}: {a} → {b}.", "App version changed {t}: {a} → {b}."),
+    "app_chg_lost": ("После обновления перестали находиться: {x}.", "After the update these are no longer found: {x}."),
+    "app_chg_ok": ("Из того, что находилось раньше, ничего не пропало.", "Nothing that was found before is missing."),
+    "v_appchg": ("Недавно изменилась версия приложения ({a} → {b}), и после этого не находятся: {x}. Возможна несовместимость плагина с новой сборкой.",
+                 "The app version changed recently ({a} → {b}) and these are no longer found: {x}. A plugin may be incompatible with the new build."),
+    "v_rec_reload": ("Перезагрузка плагинов обычно помогает ({h} из {n}): причина, скорее всего, в живом коде или хуке плагина, а не в клиенте. Ищите виновника делением пополам.",
+                     "Reloading plugins usually helps ({h} of {n}): the cause is most likely live plugin code or a hook, not the client. Look for the culprit by bisecting."),
+    "v_rec_restart": ("Перезагрузка плагинов не помогает ({h} из {n}), а полный перезапуск помогает ({h2} из {n2}): застрявшее состояние, вероятно, в самом клиенте (соединение, MessagesController), а не в Python-плагине.",
+                      "Reloading plugins does not help ({h} of {n}) but a full restart does ({h2} of {n2}): the stuck state is probably in the client itself (connection, MessagesController), not in a Python plugin."),
+    "chg_sysdisabled": ("выключен, у плагина ошибка: {e} (похоже, отключён системой)", "disabled, the plugin has an error: {e} (looks like it was disabled by the system)"),
     "e_recovered": ("всё восстановилось", "everything recovered"),
     "e_conn": ("соединение: {a} → {b} (сеть Android: {n})", "connection: {a} → {b} (Android network: {n})"),
     "e_interrupt": ("РАЗБЛОКИРОВКА: прерван поток {n}", "UNBLOCK: interrupted thread {n}"),
@@ -662,10 +722,184 @@ STR = {
     "d_cond": ("{k} уже {w} с", "{k} for {w} s already"),
 }
 
+# --- v3.8: простое меню, понятное окно проблем -------------------------------------------------
+STR.update({
+    "collect": ("Собрать полный отчёт (около 20 с)", "Collect a full report (~20 s)"),
+    "collect_sub": ("Снимок потоков и проверки. Потом отчёт можно скопировать или отправить",
+                    "A thread snapshot and checks. You can then copy or send the report"),
+    "issues_sub": ("Найдено: {n}. Что не так и что делать", "Found: {n}. What is wrong and what to do"),
+    "issues_sub0": ("Пока всё чисто. Можно проверить вручную", "All clear so far. You can run a check by hand"),
+    "last_report": ("Последний отчёт", "Latest report"),
+    "last_report_sub": ("Открыть, скопировать или отправить", "Open, copy or send"),
+    "h_state": ("Состояние", "Status"),
+    "h_wrong": ("Если что-то не так", "If something is wrong"),
+    "h_tools": ("Настройки и инструменты", "Settings and tools"),
+    "sec_recover": ("Восстановление и тесты", "Recovery and tests"),
+    "sec_problems": ("Проверки и ошибки плагинов", "Checks and plugin errors"),
+    "sec_problems_sub": ("Что искать, окно при ошибке плагина, уведомления", "What to look for, the plugin error popup, notifications"),
+    "sec_reports_sub": ("Пакет для баг-репорта, отчёт по плагину, история, дамп, перенос настроек",
+                        "Bug report bundle, plugin report, history, dump, settings transfer"),
+    "h_search": ("Что искать", "What to look for"),
+    "h_tell": ("Как сообщать", "How to tell you"),
+    "h_check": ("Проверка", "Check"),
+    "h_hist2": ("История", "History"),
+    "h_dev": ("Для разработчиков", "For developers"),
+    "h_data": ("Данные", "Data"),
+    "bn_sub": ("Один файл для сложных случаев: отчёт, окружение, история зависаний, изменения плагинов, дамп и журнал. Обычно хватает отчёта с главной страницы",
+               "One file for hard cases: report, environment, freeze history, plugin changes, dump and log. The report from the main page is usually enough"),
+    "pop_title": ("Ошибка в плагине «{who}»", "Error in plugin “{who}”"),
+    "pop_title_test": ("Пример: ошибка в плагине «{who}»", "Sample: error in plugin “{who}”"),
+    "full_hint": ("«Копировать отчёт» копирует полный текст. «В Избранное» покажет, что уйдёт, и спросит подтверждение.",
+                  "“Copy report” copies the full text. “To Saved” shows what will be sent and asks to confirm."),
+    "rp_send": ("В Избранное", "To Saved"),
+
+    # окно «Обнаруженные проблемы»
+    "dlg_issues_n": ("Обнаруженные проблемы: {n}", "Detected problems: {n}"),
+    "ir_intro": ("По каждой проблеме: что случилось, что это значит и что делать. «Копировать отчёт» кладёт в буфер полный текст со стеками и окружением: его можно показать автору плагина.",
+                 "For each problem: what happened, what it means and what to do. “Copy report” puts the full text with stacks and environment on the clipboard, so you can show it to the plugin author."),
+    "ir_copy": ("Копировать отчёт", "Copy report"),
+    "ir_more": ("Ещё…", "More…"),
+    "ir_close": ("Закрыть", "Close"),
+    "ir_scan": ("Проверить сейчас", "Check now"),
+    "ir_rescan": ("Проверить заново", "Check again"),
+    "ir_clear": ("Очистить список", "Clear the list"),
+    "ir_building": ("Собираю отчёт…", "Building the report…"),
+    "ir_copied": ("Полный отчёт скопирован", "The full report was copied"),
+    "ir_rest": ("…и ещё {n}: они есть в полном отчёте.", "…and {n} more: they are in the full report."),
+    "ir_none_hint": ("Stall Doctor сам читает журнал и следит за плагинами. Если приложение ведёт себя странно, запустите проверку вручную.",
+                     "Stall Doctor reads the log and watches plugins by itself. If the app misbehaves, run a check by hand."),
+    "ir_more_title": ("Что ещё можно сделать", "More actions"),
+    "ir_more_msg": ("«Проверить заново» перечитает журнал и плагины. «Очистить список» уберёт найденное: если проблема повторится, она появится снова.",
+                    "“Check again” re-reads the log and plugins. “Clear the list” removes what was found; if a problem repeats it will show up again."),
+    "ir_disable_q": ("Плагин «{who}» будет выключен. Включить его обратно можно в списке плагинов.",
+                     "Plugin “{who}” will be switched off. You can switch it back on in the plugin list."),
+    "ir_what": ("Что случилось", "What happened"),
+    "ir_when_l": ("Когда", "When"),
+    "ir_means": ("Что это значит", "What it means"),
+    "ir_todo": ("Что делать", "What to do"),
+    "ir_when": ("{t}, повторов: {n}", "{t}, repeats: {n}"),
+
+    # полный отчёт о проблемах
+    "ir_title": ("Stall Doctor {v} · отчёт о проблемах · {ts}", "Stall Doctor {v} · problem report · {ts}"),
+    "ir_howto": ("Как читать: у каждой проблемы указано, что случилось, что это значит и что делать. Стеки и подробности идут под ней. Ссылки, @имена и длинные числа заменены метками.",
+                 "How to read: each problem says what happened, what it means and what to do. Stacks and details follow. Links, @names and long numbers are replaced by markers."),
+    "ir_head_n": ("ПРОБЛЕМЫ: {n}", "PROBLEMS: {n}"),
+    "ir_plugin": ("Плагин: {p} v{v}, включён: {e}{f}", "Plugin: {p} v{v}, enabled: {e}{f}"),
+    "ir_details": ("Подробности:", "Details:"),
+    "ir_events": ("ЖУРНАЛ СОБЫТИЙ (последние 40)", "EVENT LOG (last 40)"),
+
+    # что означает проблема (x_) и что с ней делать (a_)
+    "x_crash": ("Приложение аварийно закрылось из-за необработанной ошибки (исключение Java). Telegram мог вылететь прямо во время работы.",
+                "The app crashed because of an unhandled error (a Java exception). Telegram may have closed in the middle of use."),
+    "a_crash": ("Стек места падения есть в полном отчёте: по нему видно, чей код вызвал ошибку.",
+                "The stack of the crash is in the full report: it shows whose code caused the error."),
+    "x_pytrace": ("В Python-коде плагина произошла необработанная ошибка. Приложение не упало, но часть функций плагина могла перестать работать.",
+                  "An unhandled error happened in the plugin's Python code. The app did not crash, but some plugin features may have stopped working."),
+    "a_pytrace": ("В полном отчёте есть файл, строка и текст ошибки: автору плагина этого достаточно, чтобы её исправить.",
+                  "The full report has the file, line and error text: that is enough for the plugin author to fix it."),
+    "x_plugin_log": ("Плагин записал ошибку в журнал приложения. Обычно это значит, что одна из его функций отработала неудачно.",
+                     "The plugin wrote an error to the app log. Usually that means one of its functions failed."),
+    "a_plugin_log": ("Если плагин работает нормально, можно не обращать внимания.", "If the plugin works fine you can ignore this."),
+    "x_hook": ("Не удалось поставить или выполнить перехват (хук) метода Telegram. Функция плагина, которая на нём держится, не работает или работает с ошибками.",
+               "A hook on a Telegram method could not be installed or run. The plugin feature that relies on it does not work or works with errors."),
+    "a_hook": ("Чаще всего плагин не подходит к этой версии приложения: проверьте, нет ли обновления плагина или приложения.",
+               "Most often the plugin does not fit this app version: check for an update of the plugin or the app."),
+    "x_exit": ("Система завершила процесс приложения.", "The system terminated the app process."),
+    "a_exit": ("Подробности есть в полном отчёте.", "Details are in the full report."),
+    "x_exit_LOW_MEMORY": ("Android закрыл процесс Telegram, потому что системе не хватало оперативной памяти. Так бывает, когда телефон перегружен. Это не всегда вина плагина, но утечки памяти и потоков повышают риск.",
+                          "Android closed the Telegram process because the system ran out of RAM. It happens when the phone is overloaded. It is not always a plugin's fault, but memory and thread leaks raise the risk."),
+    "a_exit_LOW_MEMORY": ("Закройте лишние приложения и отключите ненужные плагины. Если закрытия повторяются и во время работы с Telegram, скопируйте полный отчёт: в нём рост памяти и потоков.",
+                          "Close unneeded apps and switch off unneeded plugins. If it repeats while you are using Telegram, copy the full report: it has memory and thread growth."),
+    "x_exit_bg": ("В тот момент Telegram работал в фоне, поэтому это, скорее всего, обычная чистка памяти Android, а не сбой плагина.",
+                  "At that moment Telegram was in the background, so this is most likely Android's normal memory cleanup rather than a plugin failure."),
+    "x_exit_fg": ("В тот момент Telegram был на экране или работал как служба, такое закрытие стоит разобрать.",
+                  "At that moment Telegram was on screen or running as a service, so this exit is worth investigating."),
+    "x_exit_CRASH": ("Процесс закрылся из-за краша.", "The process closed because of a crash."),
+    "a_exit_CRASH": ("Стек падения есть в полном отчёте.", "The crash stack is in the full report."),
+    "x_exit_CRASH_NATIVE": ("Процесс упал в нативном коде (C/C++), а не в Java или Python.", "The process crashed in native code (C/C++), not in Java or Python."),
+    "a_exit_CRASH_NATIVE": ("Чаще виноваты сам Telegram или его библиотеки (видео, звонки). Если это началось после установки плагина, отключите его.",
+                            "Most often Telegram itself or its libraries (video, calls) are to blame. If it started after installing a plugin, switch that plugin off."),
+    "x_exit_ANR": ("Приложение не отвечало, и система закрыла его (ANR). Интерфейс не реагировал на нажатия.",
+                   "The app did not respond and the system closed it (ANR). The interface ignored taps."),
+    "a_exit_ANR": ("Стеки зависших потоков есть в полном отчёте.", "Stacks of the stuck threads are in the full report."),
+    "x_exit_INITIALIZATION_FAILURE": ("Приложение не смогло запуститься.", "The app could not start."),
+    "a_exit_INITIALIZATION_FAILURE": ("Отключите недавно установленные плагины и перезапустите приложение.", "Switch off recently installed plugins and restart the app."),
+    "x_exit_EXCESSIVE_RESOURCE_USAGE": ("Android ограничил приложение за чрезмерное использование ресурсов, чаще всего процессора в фоне.",
+                                        "Android penalised the app for excessive resource use, most often background CPU."),
+    "a_exit_EXCESSIVE_RESOURCE_USAGE": ("Нагрузка по потокам есть в полном отчёте.", "Load by thread is in the full report."),
+    "x_plugin_state": ("exteraGram сообщает, что плагин не загрузился, выключен из-за ошибки или не отвечает.",
+                       "exteraGram reports that the plugin failed to load, was switched off because of an error or is not responding."),
+    "a_plugin_state": ("Обновите или переустановите плагин. Если он не нужен, удалите его.", "Update or reinstall the plugin. If you do not need it, remove it."),
+    "x_ui": ("Главный (интерфейсный) поток был заблокирован: приложение не реагировало на касания. Стек места, где это случилось, есть в полном отчёте.",
+             "The main (UI) thread was blocked: the app did not react to taps. The stack of where it happened is in the full report."),
+    "a_ui": ("Если назван плагин, значит он выполняет тяжёлую работу в главном потоке.", "If a plugin is named, it does heavy work on the main thread."),
+    "x_memory": ("Память приложения (куча) почти заполнена. Рядом риск лагов и закрытия приложения.",
+                 "The app's memory (heap) is almost full. Lags and a forced close are close."),
+    "a_memory": ("Перезапустите приложение. Если повторяется, ищите плагин, который копит память: в полном отчёте есть рост памяти.",
+                 "Restart the app. If it repeats, look for a plugin that hoards memory: the full report shows memory growth."),
+    "x_memtrend": ("Занятая память приложения заметно растёт и не освобождается. Похоже на утечку.", "The app's used memory keeps growing and is not freed. It looks like a leak."),
+    "a_memtrend": ("Перезапустите приложение. Если рост повторяется, отключайте плагины по очереди: в разделе «Восстановление и тесты» есть деление пополам.",
+                   "Restart the app. If the growth repeats, switch plugins off one by one: the “Recovery and tests” section has bisecting."),
+    "x_threads": ("Число потоков в приложении быстро выросло. Потоки копятся, когда код запускает их и не завершает.",
+                  "The number of threads in the app grew fast. Threads pile up when code starts them and never ends them."),
+    "a_threads": ("В полном отчёте потоки сгруппированы по именам: по ним видно, кто их создаёт.", "In the full report threads are grouped by name: that shows who creates them."),
+    "x_pythreads": ("Плагин запускает всё новые Python-потоки и не завершает старые. Они копятся, занимают память и процессор, и в итоге приложение может тормозить или быть закрыто системой.",
+                    "The plugin keeps starting new Python threads and does not finish the old ones. They pile up, use memory and CPU, and the app may lag or be closed by the system."),
+    "a_pythreads": ("В полном отчёте есть имена потоков и строки кода, где они застряли: этого достаточно, чтобы найти утечку.",
+                    "The full report has thread names and the code lines where they are stuck: that is enough to find the leak."),
+    "x_fd": ("Приложение держит очень много открытых файлов и соединений. Когда лимит кончится, Android начнёт отказывать в новых.",
+             "The app holds very many open files and connections. When the limit runs out Android will refuse new ones."),
+    "a_fd": ("Перезапустите приложение. Если повторяется, отключайте плагины по очереди.", "Restart the app. If it repeats, switch plugins off one by one."),
+    "x_cpu": ("Процесс долго сильно грузит процессор. Это разряжает батарею и вызывает лаги.", "The process keeps the CPU busy for long. It drains the battery and causes lag."),
+    "a_cpu": ("Главные потоки перечислены в полном отчёте.", "The top threads are listed in the full report."),
+    "x_jank": ("Интерфейс микрозависает: главный поток часто задерживается дольше 200 мс.", "The interface stutters: the main thread is often delayed for over 200 ms."),
+    "a_jank": ("В полном отчёте видно, что выполнялось в момент задержки.", "The full report shows what was running at the time of the delay."),
+    "x_storage": ("На устройстве мало свободного места. Telegram может не сохранять файлы и работать нестабильно.",
+                  "The device is low on free space. Telegram may fail to save files and run unstably."),
+    "a_storage": ("Освободите место или очистите кэш Telegram («Настройки» → «Данные и память»).", "Free some space or clear the Telegram cache (Settings → Data and Storage)."),
+    "x_safemode": ("Движок плагинов работает в безопасном режиме: после сбоев часть плагинов отключена.",
+                   "The plugin engine is in safe mode: some plugins were switched off after failures."),
+    "a_safemode": ("Найдите плагин-виновник (раздел «Восстановление и тесты» → деление пополам) и включите остальные.",
+                   "Find the culprit plugin (“Recovery and tests” → bisecting) and switch the others back on."),
+    "x_notif": ("Уведомления могут приходить с задержкой или совсем не приходить: система ограничивает приложение.",
+                "Notifications may arrive late or not at all: the system restricts the app."),
+    "a_notif": ("Разрешите уведомления и работу в фоне для Telegram в настройках Android (батарея → «Без ограничений»).",
+                "Allow notifications and background work for Telegram in Android settings (battery → “Unrestricted”)."),
+    "a_who": ("Подозреваемый плагин: «{who}». Отключите его на время или обновите. Автору приложите полный отчёт (кнопка «Копировать отчёт»).",
+              "Suspected plugin: “{who}”. Switch it off for a while or update it. Attach the full report for its author (the “Copy report” button)."),
+    "a_np": ("Плагин не определён: по стеку и именам файлов найти его не удалось. В полном отчёте есть стек, окружение и список плагинов.",
+             "The plugin could not be identified from the stack or file names. The full report has the stack, environment and plugin list."),
+    "x_related": ("Возможно связано: {x}.", "Possibly related: {x}."),
+    "xh_pref": ("Простыми словами:", "In plain words:"),
+    "xh_zero": ("в коде произошло деление на ноль.", "the code divided by zero."),
+    "xh_null": ("код обратился к значению, которого нет (null или None).", "the code used a value that does not exist (null or None)."),
+    "xh_oom": ("не хватило памяти.", "out of memory."),
+    "xh_stack": ("слишком глубокая цепочка вызовов, обычно это бесконечная рекурсия.", "the call chain is too deep, usually endless recursion."),
+    "xh_conc": ("список или словарь изменили из двух потоков одновременно.", "a list or dict was changed from two threads at once."),
+    "xh_compat": ("не найден метод, поле или модуль. Чаще всего плагин не подходит к этой версии приложения или написан с ошибкой.",
+                  "a method, field or module was not found. Most often the plugin does not fit this app version or has a bug."),
+    "xh_index": ("код обратился к элементу, которого нет в списке или словаре.", "the code asked for an item that is not in a list or dict."),
+    "xh_type": ("код получил значение неподходящего вида (например, текст вместо числа).", "the code got a value of the wrong kind (for example text instead of a number)."),
+    "xh_timeout": ("что-то не дождалось ответа вовремя.", "something did not get an answer in time."),
+    "xh_perm": ("не хватило прав на действие.", "not enough permission for the action."),
+
+    # подробности, которые теперь сохраняются в самой проблеме
+    "d_pyth_series": ("Потоков плагина по проверкам: {x}", "Plugin threads by checks: {x}"),
+    "d_pythread": ("{n}× поток «{name}»: код плагина {own}; сейчас в {last}", "{n}× thread “{name}”: plugin code {own}; now in {last}"),
+    "d_exit_time": ("Время закрытия: {t}", "Closed at: {t}"),
+    "d_exit_mem": ("Память процесса при закрытии: RSS {r} МБ, PSS {p} МБ", "Process memory at exit: RSS {r} MB, PSS {p} MB"),
+    "d_exit_imp": ("Состояние приложения: {x}", "App state: {x}"),
+    "imp_fg": ("на экране или служба переднего плана", "on screen or a foreground service"),
+    "imp_vis": ("заметно пользователю", "visible to the user"),
+    "imp_svc": ("фоновая служба", "background service"),
+    "imp_cached": ("в фоне, в кэше процессов", "in the background, cached"),
+})
+
 THR_ITEMS = (["15 секунд", "30 секунд", "1 минута", "2 минуты"], ["15 seconds", "30 seconds", "1 minute", "2 minutes"])
 STORM_ITEMS = (["Выключено", "8 в минуту", "12 в минуту", "20 в минуту"], ["Off", "8 per minute", "12 per minute", "20 per minute"])
 OFFLINE_ITEMS = (["5 минут", "10 минут", "30 минут", "1 час"], ["5 minutes", "10 minutes", "30 minutes", "1 hour"])
 ERR_INTERVAL_ITEMS = (["30 секунд", "1 минута", "3 минуты", "10 минут"], ["30 seconds", "1 minute", "3 minutes", "10 minutes"])
+TTL_ITEMS = (["1 день", "3 дня", "7 дней", "Не забывать"], ["1 day", "3 days", "7 days", "Never"])
 LANG_ITEMS = (["Как в приложении", "Русский", "English"], ["Same as the app", "Russian", "English"])
 
 
@@ -717,45 +951,67 @@ def _g(obj, name):
         if callable(v) and not isinstance(v, (bool, int, float, str)):
             try:
                 v = v()
-            except Exception:
-                pass
+            except Exception as _e:
+                _swallow(_e)
         return v
     except Exception:
         return None
 
 
 class Probe:
-    """Одна проверка «жив ли канал». Не копит запросы: пока предыдущая не вернулась, новая не уходит."""
+    """Одна проверка «жив ли канал». Не копит запросы: пока предыдущая не вернулась, новая не уходит.
+    Если ответ не пришёл за PROBE_LOST секунд, проба считается потерянной и уходит новая; «время ожидания»
+    при этом не обнуляется, пока хоть какой-то ответ не вернётся (настоящее зависание не маскируется)."""
 
     def __init__(self, name):
         self.name = name
         self.sent = None
+        self.since = None      # с какого момента нет ни одного ответа
+        self.gen = 0
+        self.lost = 0
         self.last_fire = 0.0
         self.last_latency = None
         self.last_error = None
         self.done_at = None
 
     def pending_for(self, now):
-        return (now - self.sent) if self.sent else 0.0
+        return (now - self.since) if self.since else 0.0
+
+    def reset(self):
+        self.gen += 1
+        self.sent = None
+        self.since = None
 
     def fire(self, runner, now):
         if self.sent is not None:
-            return
+            if now - self.sent < PROBE_LOST:
+                return
+            self.lost += 1
+            self.last_error = f"no callback for {int(now - self.sent)}s"
+            self.sent = None
+        self.gen += 1
+        gen = self.gen
         self.sent = now
+        if self.since is None:
+            self.since = now
         self.last_fire = now
         t0 = now
 
         def done(err=None):
+            # любой ответ, даже запоздалый, доказывает, что канал жив
             self.last_latency = time.time() - t0
             self.last_error = err
             self.done_at = time.time()
-            self.sent = None
+            self.since = None
+            if gen == self.gen:
+                self.sent = None
 
         try:
             runner(done)
         except Exception as e:
             self.last_error = f"send failed: {e}"
             self.sent = None
+            self.since = None
 
 
 class StallDoctorPlugin(BasePlugin):
@@ -784,8 +1040,8 @@ class StallDoctorPlugin(BasePlugin):
         self._rlang = None
         try:
             self.set_setting("ui_refresh", time.time(), reload_settings=True)
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
 
     def on_plugin_load(self):
         try:
@@ -844,9 +1100,20 @@ class StallDoctorPlugin(BasePlugin):
             self.last_notify = 0.0
             self.loaded_at = time.time()
             self.issues = {}
+            try:
+                self.cleared_at = float(self.get_setting("cleared_at", 0) or 0)
+            except Exception:
+                self.cleared_at = 0.0
             self.issue_lock = threading.Lock()
             self.health_lock = threading.Lock()
             self.last_log_ts = None
+            self.log_edge = set()
+            self.own_toggle = {}
+            self.prog_last = None
+            self.prog_at = time.time()
+            self.ep_prev_end = 0.0
+            self.ep_prev = None
+            self.last_report_t = 0.0
             self.exit_done = False
             self.last_issue_notify = 0.0
             self.next_err = time.time() + 40
@@ -906,7 +1173,7 @@ class StallDoctorPlugin(BasePlugin):
             elif "START" in name or "RESUME" in name:
                 self.paused = False
                 for pr in self.probes.values():
-                    pr.sent = None
+                    pr.reset()
                 self.cond_since.clear()
                 self.skip_until = time.time() + 10
         except Exception as e:
@@ -919,8 +1186,8 @@ class StallDoctorPlugin(BasePlugin):
             self._remove_observer()
             self.ev(self.t("e_unloaded"))
             self._flush_journal()
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
 
     def _log(self, text):
         # self.logger (тег plugin.stall_doctor) вместо устаревшего log()
@@ -929,8 +1196,8 @@ class StallDoctorPlugin(BasePlugin):
         except Exception:
             try:
                 android_log(f"[SD] {text}")
-            except Exception:
-                pass
+            except Exception as _e:
+                _swallow(_e)
 
     def _acc(self):
         try:
@@ -1045,8 +1312,8 @@ class StallDoctorPlugin(BasePlugin):
     def _bump(self, key):
         try:
             self.set_setting(key, int(self.get_setting(key, 0) or 0) + 1)
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
 
     # ---------- рефлексия и состояние ОС ----------
 
@@ -1056,8 +1323,8 @@ class StallDoctorPlugin(BasePlugin):
             for suffix in ("Connecting", "WaitingForNetwork", "Connected", "ConnectingToProxy", "Updating"):
                 try:
                     self.state_names[int(getattr(cm_cls, "ConnectionState" + suffix))] = suffix
-                except Exception:
-                    pass
+                except Exception as _e:
+                    _swallow(_e)
         except Exception as e:
             self.ev(f"state names: {e}")
 
@@ -1078,8 +1345,8 @@ class StallDoctorPlugin(BasePlugin):
                 if rx.search(name):
                     try:
                         f.setAccessible(True)
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        _swallow(_e)
                     res[name] = f
         except Exception as e:
             self.ev(f"reflection {class_name}: {e}")
@@ -1118,8 +1385,8 @@ class StallDoctorPlugin(BasePlugin):
                 return False
             caps = cmgr.getNetworkCapabilities(net)
             return bool(caps is not None and caps.hasCapability(12))  # NET_CAPABILITY_INTERNET
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
         try:
             return bool(get_connections_manager(acc).isNetworkOnline())
         except Exception:
@@ -1187,8 +1454,8 @@ class StallDoctorPlugin(BasePlugin):
                         doctor.diff_started = time.time()
                         doctor.gd_calls.append(doctor.diff_started)
                         doctor._hook_event("gd", "MessagesController.getDifference() called")
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        _swallow(_e)
 
             mc = find_class("org.telegram.messenger.MessagesController")
             if mc:
@@ -1207,8 +1474,8 @@ class StallDoctorPlugin(BasePlugin):
                         v = bool(param.args[0])
                         doctor.upd_flag = (v, time.time())
                         doctor._hook_event("upd" + str(v), f"ConnectionsManager.setIsUpdating({v})")
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        _swallow(_e)
 
             cm = find_class("org.telegram.tgnet.ConnectionsManager")
             if cm:
@@ -1232,7 +1499,7 @@ class StallDoctorPlugin(BasePlugin):
             if lag > SLEEP_LAG:
                 # телефон спал или процесс был заморожен: старые замеры недостоверны
                 for p in self.probes.values():
-                    p.sent = None
+                    p.reset()
                 self.cond_since.clear()
                 self.skip_until = now + 10
                 self.ev(self.t("e_sleep", lag=int(lag)))
@@ -1242,8 +1509,8 @@ class StallDoctorPlugin(BasePlugin):
                 self._part("cpu", self._cpu_sample, now)
             try:
                 self._flush_journal()
-            except Exception:
-                pass
+            except Exception as _e:
+                _swallow(_e)
             self._part("errwatch", self._err_watch_tick, now)
             if self.paused:
                 try:
@@ -1251,8 +1518,8 @@ class StallDoctorPlugin(BasePlugin):
                     self.last_net = net
                     self._net_track(net, now)
                     self._part("proxy", self._proxy_track, now)
-                except Exception:
-                    pass
+                except Exception as _e:
+                    _swallow(_e)
                 self.stop.wait(25)
                 last = time.time()   # иначе следующий круг примет эту паузу за сон телефона
                 continue
@@ -1295,14 +1562,18 @@ class StallDoctorPlugin(BasePlugin):
         paused = False
         try:
             paused = bool(self._cm_fields(acc).get("appPaused"))
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
         gd = None
+        mcv = None
         try:
-            gd = self._getting_difference(self._mc_fields(acc))
+            mcv = self._mc_fields(acc)
+            gd = self._getting_difference(mcv)
         except Exception as e:
             self.ev(f"MessagesController fields: {e}")
         self._net_track(net, now)
+        if net and self.last_net is False:
+            self.probes["ping"].reset()     # сеть вернулась: запрос, ушедший в пустоту, не считаем зависанием
         self.last_net = net
         self._part("proxy", self._proxy_track, now)
         if conn != self.last_conn:
@@ -1310,7 +1581,26 @@ class StallDoctorPlugin(BasePlugin):
         if gd != self.last_gd:
             self.ev(f"gettingDifference: {self.last_gd} → {gd}")
             self.last_gd = gd
-        return {"t": now, "conn": conn, "net": net, "gd": gd, "paused": paused}
+        prog = self._progress_vals(mcv)
+        if prog is not None:
+            if prog != self.prog_last:
+                self.prog_last = prog
+                self.prog_at = now
+        else:
+            self.prog_last = None
+        return {"t": now, "conn": conn, "net": net, "gd": gd, "paused": paused, "prog": prog}
+
+    @staticmethod
+    def _progress_vals(mcv):
+        """Числовые счётчики догоняния обновлений (pts/qts/seq/date) или None, если прочитать их не удалось."""
+        try:
+            vals = tuple(sorted((k, v) for k, v in (mcv or {}).items()
+                                if isinstance(v, (int, float)) and not isinstance(v, bool)
+                                and re.search(r"lastPts|lastQts|lastSeq|lastDate|dialogsLoadedTill", k)))
+            return vals or None
+        except Exception as e:
+            _swallow(e)
+            return None
 
     def _net_track(self, net, now):
         if not self.get_setting("net_track", True):
@@ -1366,7 +1656,11 @@ class StallDoctorPlugin(BasePlugin):
         except Exception:
             idx = 1
         threshold = THRESHOLDS[min(max(idx, 0), len(THRESHOLDS) - 1)]
-        soft_long = [(k, now - v) for k, v in self.cond_since.items() if now - v >= threshold]
+        # Долгое «Updating» / getDifference само по себе не зависание (после офлайна синк бывает долгим):
+        # считаем его зависанием, только если pts/seq при этом не двигаются. Нет данных о pts: как раньше, по времени.
+        advancing = s.get("prog") is not None and (now - self.prog_at) < threshold
+        soft_long = [(k, now - v) for k, v in self.cond_since.items()
+                     if now - v >= threshold and not (k in PROGRESS_KEYS and advancing)]
 
         self.suspicious = bool(hard or soft)
         stalled = bool(hard or soft_long)
@@ -1374,13 +1668,22 @@ class StallDoctorPlugin(BasePlugin):
             self.healthy_ticks = 0
             if not self.episode:
                 self.episode = True
-                self._bump("stat_episodes")
                 self._rlang = None
                 parts = [self.t("d_problem", n=n, w=int(w)) for n, w in hard] + [self.t("d_cond", k=k, w=int(w)) for k, w in soft_long]
                 reason = "; ".join(parts)
-                self.ev(self.t("e_freeze", x=reason))
-                self._episode_start(now, reason, s)
-                threading.Thread(target=self.make_report, args=(reason, False), name="StallDoctorReport", daemon=True).start()
+                if self.ep_prev and now - self.ep_prev_end < EP_MERGE_SEC:
+                    # заминка вернулась сразу после конца прошлой: это продолжение, а не новый эпизод
+                    self.ev(self.t("e_freeze_again", x=reason))
+                    self.ep_cur = self.ep_prev
+                    self._episode_update(self.ep_cur["t0"], open=True, dur=None)
+                else:
+                    self._bump("stat_episodes")
+                    self.ev(self.t("e_freeze", x=reason))
+                    self._episode_start(now, reason, s)
+                self.ep_prev = None
+                if now - self.last_report_t >= REPORT_GAP:
+                    self.last_report_t = now
+                    threading.Thread(target=self.make_report, args=(reason, False), name="StallDoctorReport", daemon=True).start()
                 if (self.get_setting("auto_nudge", False) and s["net"]
                         and self.state_names.get(s["conn"]) == "WaitingForNetwork"):
                     threading.Thread(target=self.nudge_now, name="StallDoctorNudge", daemon=True).start()
@@ -1402,10 +1705,12 @@ class StallDoctorPlugin(BasePlugin):
         if w > 0:
             return self.t("pr_wait", w=f"{w:.1f}")
         if p.last_latency is None:
-            return self.t("pr_none")
+            return self.t("pr_notyet")
         s = f"{p.last_latency * 1000:.0f} ms"
         if p.last_error:
             s += " (" + self.t("pr_err", e=p.last_error) + ")"
+        if p.lost:
+            s += " · " + self.t("pr_lost", n=p.lost)
         return s
 
     # ---------- снимок потоков ----------
@@ -1469,7 +1774,8 @@ class StallDoctorPlugin(BasePlugin):
         return found
 
     @staticmethod
-    def _match_plugins(pkgs, ids):
+    def _match_plugins(pkgs, ids, weak=None):
+        """weak: если передан set, в него попадают плагины, найденные только по куску имени (менее надёжно)."""
         res = []
         for pkg in pkgs:
             segs = [x for x in pkg.lower().split(".") if len(x) >= 4 and x not in GENERIC_SEGS]
@@ -1481,6 +1787,10 @@ class StallDoctorPlugin(BasePlugin):
                     if sg == pl or sg == norm or sg in toks:
                         if pid not in res:
                             res.append(pid)
+                        if weak is not None and sg != pl and sg != norm:
+                            weak.add(pid)
+                        elif weak is not None:
+                            weak.discard(pid)
                         break
         return res
 
@@ -1568,15 +1878,42 @@ class StallDoctorPlugin(BasePlugin):
             self.ev(f"plugin list: {e}")
         return res
 
+    def _stem_map(self):
+        """Имя файла плагина -> его __id__ (читаем первые КБ файла). Нужна, чтобы виновник из стека
+        назывался настоящим id, а не именем файла, и один плагин не считался за два."""
+        now = time.time()
+        if now - _STEM_CACHE[0] < 60:
+            return _STEM_CACHE[1]
+        res = {}
+        try:
+            d = str(get_plugins_dir())
+            for n in os.listdir(d):
+                stem = n.rsplit(".", 1)[0]
+                if not stem or stem.startswith("_"):
+                    continue
+                try:
+                    with open(os.path.join(d, n), "r", encoding="utf-8", errors="ignore") as fh:
+                        m = ID_RE.search(fh.read(16384))
+                    res[stem] = m.group(1) if m else stem
+                except Exception as e:
+                    _swallow(e)
+                    res[stem] = stem
+        except Exception as e:
+            _swallow(e)
+        _STEM_CACHE[0] = now
+        _STEM_CACHE[1] = res
+        STEM_MAP.clear()
+        STEM_MAP.update({k: v for k, v in res.items() if k != v})
+        return res
+
     def _plugin_ids(self, infos=None):
         ids = set()
         try:
-            for n in os.listdir(str(get_plugins_dir())):
-                stem = n.rsplit(".", 1)[0]
-                if stem and not stem.startswith("_") and stem != "stall_doctor":
-                    ids.add(stem)
-        except Exception:
-            pass
+            for stem, pid in self._stem_map().items():
+                if pid != "stall_doctor" and stem != "stall_doctor":
+                    ids.add(pid)
+        except Exception as e:
+            _swallow(e)
         for p in (infos if infos is not None else self._plugins_info()):
             if p.get("id") and p["id"] != "stall_doctor":
                 ids.add(str(p["id"]))
@@ -1596,8 +1933,8 @@ class StallDoctorPlugin(BasePlugin):
                     f.setAccessible(True)
                     if str(f.getName()) != "Companion":
                         out.append(f"{f.getName()} = {short(f.get(w), 120)}")
-                except Exception:
-                    pass
+                except Exception as _e:
+                    _swallow(_e)
         except Exception as e:
             out.append(f"(unavailable: {e})")
         return out
@@ -1626,14 +1963,14 @@ class StallDoctorPlugin(BasePlugin):
                 for p in (old, old[:-4] + ".short.txt"):
                     try:
                         os.remove(p)
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        _swallow(_e)
             first = verdict[0] if verdict else "-"
             self.ev(self.t("e_saved", f=os.path.basename(path), v=short(first, 200)))
             ui_msg = "\n\n".join(verdict[:4])
             self._rlang = None
             if manual:
-                run_on_ui_thread(lambda: self._dialog(self.t("dlg_result"), ui_msg))
+                run_on_ui_thread(lambda: self._report_dialog(self.t("dlg_result"), ui_msg))
             elif self.get_setting("notify", True) and time.time() - self.last_notify > NOTIFY_COOLDOWN:
                 self.last_notify = time.time()
                 run_on_ui_thread(lambda: BulletinHelper.show_error(self.t("freeze_notify")))
@@ -1677,11 +2014,12 @@ class StallDoctorPlugin(BasePlugin):
         suspects_soft = [p for p in mentioned(stuck_py_own) if p not in suspects_hard]
         verdict = self._diagnose(now, acc, stuck_java, suspects_hard, suspects_soft)
         chain_lines, rescue, pkgs = self._analyze_chains(a, b)
-        culprits = self._match_plugins(pkgs, ids)
-        self._note_culprits(sorted(set(culprits) | set(suspects_hard)))
+        weak_c = set()
+        culprits = self._match_plugins(pkgs, ids, weak_c)
+        self._note_culprits(sorted((set(culprits) - weak_c) | set(suspects_hard)))
         top = []
         if pkgs:
-            who = ", ".join(culprits) if culprits else t("v_unnamed")
+            who = ", ".join((c + " (?)") if c in weak_c else c for c in culprits) if culprits else t("v_unnamed")
             top.append(t("v_culprit", who=who, pk=", ".join(pkgs)))
             if culprits:
                 top.append(t("v_advice", who=", ".join(culprits)))
@@ -1707,16 +2045,16 @@ class StallDoctorPlugin(BasePlugin):
             cm_state = self.state_names.get(int(cm.getConnectionState()), str(cm.getConnectionState()))
             net = self._os_online(acc)
             paused = bool(self._cm_fields(acc).get("appPaused"))
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
         proxy = self._proxy_enabled()
         yn = lambda v: t("unknown") if v is None else (t("yes") if v else t("no"))
 
         build = ""
         try:
             build = str(jclass("org.telegram.messenger.BuildVars").BUILD_VERSION_STRING)
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
         head = [t("r_title", v=__version__, ts=time.strftime("%Y-%m-%d %H:%M:%S"), kind=t("r_manual") if manual else t("r_auto")),
                 t("r_reason", x=reason), t("r_app", b=build or "?", a=acc)]
         probe_lines = []
@@ -1928,6 +2266,12 @@ class StallDoctorPlugin(BasePlugin):
             pat = self._episode_pattern()
             if pat:
                 out.append(pat)
+            ac = self._jget("app_change", None)
+            if isinstance(ac, dict) and ac.get("lost") and now - float(ac.get("t", 0)) < 3 * 86400:
+                out.append(t("v_appchg", a=ac.get("a"), b=ac.get("b"), x=", ".join(ac["lost"][:8])))
+            rv = self._recovery_verdict()
+            if rv:
+                out.append(rv)
         slow = self._lat_slow() if self.get_setting("lat_profile", True) else []
         if slow:
             out.append(t("v_slow", x="; ".join(slow)))
@@ -1952,24 +2296,61 @@ class StallDoctorPlugin(BasePlugin):
 
     @staticmethod
     def _row_epoch(ts):
-        try:
-            year = time.localtime().tm_year
-            ep = time.mktime(time.strptime(f"{year}-{ts[:14]}", "%Y-%m-%d %H:%M:%S"))
-            if ep > time.time() + 86400:      # строка из декабря, читаем в январе
-                ep = time.mktime(time.strptime(f"{year - 1}-{ts[:14]}", "%Y-%m-%d %H:%M:%S"))
+        now = time.time()
+        year = time.localtime(now).tm_year
+        for y in (year, year - 1):          # второй вариант: строка из декабря, читаем в январе; и 29 февраля
+            try:
+                ep = time.mktime(time.strptime(f"{y}-{ts[:14]}", "%Y-%m-%d %H:%M:%S"))
+            except Exception:
+                continue
+            if ep > now + 86400:
+                continue
+            try:
+                ep += int(ts[15:18]) / 1000.0
+            except Exception as _e:
+                _swallow(_e)
             return ep
-        except Exception:
-            return time.time()
+        return now
 
     @staticmethod
     def _plugins_from_paths(text, ids):
         found = []
         for m in PLUGIN_PATH_RE.finditer(text):
-            if m.group(1) in ids and m.group(1) not in found:
-                found.append(m.group(1))
+            pid = STEM_MAP.get(m.group(1), m.group(1))
+            if pid in ids and pid not in found:
+                found.append(pid)
         return found
 
-    def _add_issue(self, kind, plugins, summary, detail, epoch, pkgs=(), unique=False):
+    def _issue_ttl(self):
+        try:
+            return ISSUE_TTL[min(max(int(self.get_setting("issue_ttl", 1)), 0), len(ISSUE_TTL) - 1)]
+        except Exception:
+            return ISSUE_TTL[1]
+
+    def _issue_expired(self, epoch):
+        ttl = self._issue_ttl()
+        return bool(ttl) and epoch < time.time() - ttl
+
+    def _prune_issues(self):
+        with self.issue_lock:
+            for k in [k for k, v in self.issues.items() if self._issue_expired(v["epoch"])]:
+                del self.issues[k]
+
+    def _forget_issues(self):
+        """Очищает список и запоминает момент: события старше него больше не вернутся (журнал и история Android перечитываются)."""
+        self.cleared_at = time.time()
+        try:
+            self.set_setting("cleared_at", str(self.cleared_at))
+        except Exception as _e:
+            _swallow(_e)
+        with self.issue_lock:
+            self.issues.clear()
+
+    def _add_issue(self, kind, plugins, summary, detail, epoch, pkgs=(), unique=False, extra=None):
+        if epoch <= getattr(self, "cleared_at", 0) or self._issue_expired(epoch):
+            return
+        if plugins and any(str(p).startswith("sdchk") for p in plugins):
+            return      # строки, которые сам плагин пишет при проверке журнала
         plug = ", ".join(plugins) if plugins else ""
         key = (kind, plug, re.sub(r"\d+", "#", summary)[:120])
         created = False
@@ -1983,7 +2364,7 @@ class StallDoctorPlugin(BasePlugin):
             else:
                 created = True
                 self.issues[key] = {"key": key, "kind": kind, "plugin": plug, "summary": summary, "detail": list(detail),
-                                    "pkgs": list(pkgs), "count": 1, "epoch": epoch}
+                                    "pkgs": list(pkgs), "count": 1, "epoch": epoch, "extra": dict(extra or {})}
                 if len(self.issues) > 200:
                     oldest = min(self.issues.values(), key=lambda v: v["epoch"])
                     self.issues.pop(oldest["key"], None)
@@ -2013,14 +2394,40 @@ class StallDoctorPlugin(BasePlugin):
             self.ev(f"logcat via Runtime: {e}")
         return []
 
-    def _parse_log(self, lines, ids):
+    def _parse_log(self, lines, ids, sink=None):
+        add = sink or self._add_issue   # sink: проверка журнала собирает находки, не трогая настоящие проблемы и курсор
         rows = []
         for ln in lines:
             m = LOG_RE.match(ln)
             rows.append(m.groups() if m else None)
-        cutoff = self.last_log_ts
-        stamps = [r[0] for r in rows if r]
-        newest = max(stamps + ([cutoff] if cutoff else [])) if stamps or cutoff else None
+        # время каждой строки в секундах (с миллисекундами); курсор хранится числом, а не строкой «ММ-ДД ЧЧ:ММ»,
+        # иначе после Нового года или перевода часов все новые строки выглядели бы «старыми»
+        ecache = {}
+        eps = []
+        for r in rows:
+            if not r:
+                eps.append(None)
+                continue
+            k = r[0][:14]
+            base = ecache.get(k)
+            if base is None:
+                base = ecache[k] = self._row_epoch(k + ".000")
+            try:
+                eps.append(base + int(r[0][15:18]) / 1000.0)
+            except Exception:
+                eps.append(base)
+        cutoff = None if sink else self.last_log_ts
+        edge = set() if sink else self.log_edge
+        valid = [e for e in eps if e is not None]
+        newest = max(valid) if valid else None
+        if cutoff is not None and newest is not None and newest < cutoff - LOG_CLOCK_BACK:
+            # время в журнале пошло назад (перевод часов): старый курсор больше не годится, берём новый и ничего не разбираем
+            self.ev(self.t("e_log_clock", d=fmt_dur(cutoff - newest)))
+            self.last_log_ts = newest
+            self.log_edge = {(r[0], r[1], r[2], r[5][:60]) for r, e in zip(rows, eps) if r and e == newest}
+            return
+        if cutoff is not None and newest is not None and newest < cutoff:
+            newest = cutoff
         n = len(rows)
         i = 0
         while i < n:
@@ -2029,9 +2436,12 @@ class StallDoctorPlugin(BasePlugin):
             if not row:
                 continue
             ts, pid, tid, lvl, tag, msg = row
-            if cutoff and ts <= cutoff:
-                continue
-            ep = self._row_epoch(ts)
+            ep = eps[i - 1]
+            if cutoff is not None:
+                if ep < cutoff:
+                    continue
+                if ep == cutoff and (ts, pid, tid, msg[:60]) in edge:
+                    continue
             if lvl in "EF" and "FATAL EXCEPTION" in msg:
                 block, j = [], i
                 while j < n and len(block) < 45:
@@ -2044,8 +2454,10 @@ class StallDoctorPlugin(BasePlugin):
                 exc = next((b for b in block if re.search(r"(Exception|Error)\b", b) and not b.lstrip().startswith("at ")),
                            block[0] if block else "FATAL EXCEPTION")
                 pk = self._foreign_pkgs([b.strip()[3:] for b in block if b.lstrip().startswith("at ")])
-                plug = self._match_plugins(pk, ids)
-                self._add_issue("crash", plug, self._redact(exc), [self._redact(x) for x in block[:12]], ep, pk)
+                wk = set()
+                plug = self._match_plugins(pk, ids, wk)
+                add("crash", plug, self._redact(exc), [self._redact(x) for x in block[:12]], ep, pk,
+                                extra={"weak": sorted(wk)} if wk else None)
             elif "Traceback (most recent call last)" in msg:
                 block, j = [msg], i
                 while j < n and len(block) < 30:
@@ -2056,13 +2468,16 @@ class StallDoctorPlugin(BasePlugin):
                     j += 1
                 i = j
                 plug = self._plugins_from_paths("\n".join(block), ids)
-                self._add_issue("pytrace", plug, self._redact(block[-1].strip()), [self._redact(x) for x in block[-10:]], ep)
+                add("pytrace", plug, self._redact(block[-1].strip()), [self._redact(x) for x in block[-10:]], ep)
             elif lvl in "EF" and tag.startswith("plugin."):
-                self._add_issue("plugin_log", [tag[7:].split(".")[0]], self._redact(msg, 160), [], ep)
+                add("plugin_log", [tag[7:].split(".")[0]], self._redact(msg, 160), [], ep)
             elif lvl in "EW" and tag in ("LSPosed", "LSPosed-Bridge", "Xposed", "XposedBridge") \
                     and ("xception" in msg or ("hook" in msg.lower() and "fail" in msg.lower())):
-                self._add_issue("hook", [p for p in ids if p in msg], self._redact(msg, 160), [], ep)
-        self.last_log_ts = newest
+                add("hook", [p for p in ids if p in msg], self._redact(msg, 160), [], ep)
+        if newest is not None and sink is None:
+            keep = {(r[0], r[1], r[2], r[5][:60]) for r, e in zip(rows, eps) if r and e == newest}
+            self.log_edge = (edge | keep) if newest == cutoff else keep
+            self.last_log_ts = newest
 
     def _anr_frames(self, info):
         frames = []
@@ -2114,9 +2529,32 @@ class StallDoctorPlugin(BasePlugin):
                 detail = [self._redact(f) for f in frames[:12]]
                 if reason == 9:
                     detail = [self.t("i_cpu_exit")] + self._cpu_lines(5)
-                self._add_issue("exit", plug, self._redact(f"{EXIT_NAMES[reason]}: {desc}", 140), detail, ts, pk, unique=True)
+                lines, extra = self._exit_facts(info, ts)
+                if reason == 3 and extra.get("bg") and self.get_setting("hide_bg_lowmem", True):
+                    continue
+                self._add_issue("exit", plug, self._redact(f"{EXIT_NAMES[reason]}: {desc}", 140), lines + detail, ts, pk,
+                                unique=True, extra=extra)
             except Exception as e:
                 self.ev(f"exit info item: {e}")
+
+    def _exit_facts(self, info, ts):
+        """Что известно о закрытии процесса: когда, сколько памяти занимал, был ли он на экране."""
+        t = self.t
+        lines, extra = [t("d_exit_time", t=time.strftime("%m-%d %H:%M:%S", time.localtime(ts)))], {}
+        try:
+            rss, pss = int(info.getRss()), int(info.getPss())
+            if rss or pss:
+                lines.append(t("d_exit_mem", r=rss >> 10, p=pss >> 10))
+        except Exception as _e:
+            _swallow(_e)
+        try:
+            imp = int(info.getImportance())
+            extra["bg"] = imp >= 300
+            key = "imp_fg" if imp <= 125 else ("imp_vis" if imp <= 270 else ("imp_svc" if imp < 400 else "imp_cached"))
+            lines.append(t("d_exit_imp", x=f"{t(key)} ({imp})"))
+        except Exception as _e:
+            _swallow(_e)
+        return lines, extra
 
     def _plugin_state_issues(self):
         with self.issue_lock:
@@ -2144,12 +2582,14 @@ class StallDoctorPlugin(BasePlugin):
         frames = [str(arr[i]) for i in range(len(arr))]
         pk = self._foreign_pkgs(frames)
         ids = self._plugin_ids()
-        plug = self._match_plugins(pk, ids)
+        wk = set()
+        plug = self._match_plugins(pk, ids, wk)
         if not plug and not pk:
             snap = self._snap()["py"]
             files = " ".join(f for info in snap.values() if info["foreign"] for f, _, _ in info["frames"])
-            plug = [pid for pid in sorted(ids) if pid in files]
-        self._add_issue("ui", plug, self.t("i_ui", w=int(w)), frames[:14], now, pk)
+            plug = self._plugins_from_paths(files, ids)
+        self._add_issue("ui", plug, self.t("i_ui", w=int(w)), frames[:14], now, pk,
+                        extra={"weak": sorted(wk)} if wk else None)
 
     def _watch_memory(self, now):
         self.tick_n += 1
@@ -2170,7 +2610,8 @@ class StallDoctorPlugin(BasePlugin):
             items = sorted(self.issues.values(), key=lambda v: (v["plugin"] == "", v["kind"] not in ("crash", "exit", "ui", "pytrace"), -v["count"], -v["epoch"]))
         lines = []
         for it in items[:limit]:
-            who = it["plugin"] or self.t("who_unknown")
+            wk = (it.get("extra") or {}).get("weak") or []
+            who = ", ".join((p + " (?)") if p in wk else p for p in it["plugin"].split(", ")) if it["plugin"] else self.t("who_unknown")
             what = f"{self.t('k_' + it['kind'])}: {short(it['summary'], 110)}"
             lines.append(self.t("i_line", who=who, what=what, n=it["count"], t=time.strftime("%m-%d %H:%M", time.localtime(it["epoch"]))))
             if detail:
@@ -2198,8 +2639,8 @@ class StallDoctorPlugin(BasePlugin):
             self.notified.add(nid)
             try:
                 self.set_setting("notified_keys", json.dumps(sorted(self.notified)[-60:]))
-            except Exception:
-                pass
+            except Exception as _e:
+                _swallow(_e)
             self.last_issue_notify = now
             msg = self.t("n_issue", who=it["plugin"], what=f"{self.t('k_' + it['kind'])}")
             run_on_ui_thread(lambda: BulletinHelper.show_error(msg))
@@ -2304,14 +2745,14 @@ class StallDoctorPlugin(BasePlugin):
                 self.popup_plugin_ts[who] = time.time()
                 try:
                     self.set_setting("popped_keys", json.dumps(sorted(self.popped)[-80:]))
-                except Exception:
-                    pass
+                except Exception as _e:
+                    _swallow(_e)
                 self.ev(f"error popup: {who} {it['kind']}")
             text = self._error_text(it, plug)
             if test:
                 text += "\n\n" + self.t("ep_test_note")
             b = AlertDialogBuilder(act)
-            b.set_title(self.t("ep_title_test" if test else "ep_title", who=who))
+            b.set_title(self.t("pop_title_test" if test else "pop_title", who=who))
             b.set_message(text[:3500])
             b.set_positive_button(self.t("ep_disable", who=short(who, 24)), lambda bld, w: (bld.dismiss(), self._err_disable(who, test)))
             b.set_negative_button(self.t("copy"), lambda bld, w: (copy_to_clipboard(f"{who}\n{text}"), bld.dismiss()))
@@ -2387,19 +2828,25 @@ class StallDoctorPlugin(BasePlugin):
                  for pl, g in sorted(groups.items(), key=lambda x: -x[1][0])]
         self._dialog(self.t("err_list"), "\n\n".join(lines) or self.t("err_none"))
 
-    def _s_errors(self, li):
+    def _s_problems(self, li):
         t = self.t
         return self._spaced([
-            Header(text=t("h_errors")),
+            Header(text=t("h_search")),
             Switch(key="err_watch", text=t("err_watch"), default=True, icon="msg_info", subtext=t("err_watch_sub")),
             Selector(key="err_interval", text=t("err_interval"), default=1, icon="msg_list", items=ERR_INTERVAL_ITEMS[li]),
-            Header(text=t("h_popup")),
+            Switch(key="scan_logs", text=t("scan_logs"), default=True, icon="msg_log", subtext=t("scan_logs_sub")),
+            Switch(key="scan_exits", text=t("scan_exits"), default=True, icon="msg_info"),
+            Switch(key="env_check", text=t("env_check"), default=True, icon="msg_info"),
+            Switch(key="track_changes", text=t("track_changes"), default=True, icon="msg_info"),
+            Selector(key="issue_ttl", text=t("issue_ttl"), default=1, icon="msg_list", items=TTL_ITEMS[li]),
+            Switch(key="hide_bg_lowmem", text=t("hide_lowmem"), default=True, icon="msg_info", subtext=t("hide_lowmem_sub")),
+            Text(text=t("clr_issues"), subtext=t("clr_issues_sub"), icon="msg_delete", red=True, on_click=lambda v: self._act_clear_issues()),
+            Header(text=t("h_tell")),
+            Switch(key="notify_issues", text=t("notify_issues"), default=True, icon="msg_info"),
             Switch(key="err_popup", text=t("err_popup"), default=True, icon="msg_info", subtext=t("err_popup_sub")),
             Selector(key="err_level", text=t("err_level"), default=0, icon="msg_list", items=[t("lv_all"), t("lv_serious")]),
             Input(key="err_ignore", text=t("err_ignore"), default="", subtext=t("err_ignore_sub"), icon="msg_list"),
-            Header(text=t("h_errview")),
-            Text(text=t("err_list"), subtext=t("err_list_sub"), icon="msg_list", on_click=lambda v: self._act_err_by_plugin()),
-            Text(text=t("issues"), subtext=t("issues_sub", n=len(self.issues)), icon="msg_log", on_click=lambda v: self._act_issues()),
+            Header(text=t("h_check")),
             Text(text=t("err_test"), subtext=t("err_test_sub"), icon="msg_retry", on_click=lambda v: self._act_err_test()),
         ])
 
@@ -2527,8 +2974,8 @@ class StallDoctorPlugin(BasePlugin):
     def _jset(self, key, val):
         try:
             self.set_setting(key, json.dumps(val, ensure_ascii=False))
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
 
     def _note_culprits(self, names):
         names = [n for n in names if n and n != "stall_doctor"]
@@ -2563,6 +3010,9 @@ class StallDoctorPlugin(BasePlugin):
             add("MessagesController fields", fm, ", ".join(sorted(fm)))
             add("MessagesController.gettingDifference",
                 any("gettingdifference" in k.lower() and "channel" not in k.lower() for k in fm))
+            pv = self._progress_vals(self._mc_fields(self._acc()))
+            add("progress fields readable (pts/seq)", pv is not None,
+                ", ".join(k for k, _ in pv) if pv else "the Updating/getDifference freeze rule falls back to time-based")
             fc = self._field_map("cm", "org.telegram.tgnet.ConnectionsManager", CM_FIELDS_RE)
             add("ConnectionsManager.appPaused", any(k.lower() == "apppaused" for k in fc), ", ".join(sorted(fc)))
         except Exception as e:
@@ -2595,7 +3045,16 @@ class StallDoctorPlugin(BasePlugin):
                 hasattr(ctx.getSystemService("activity"), "getHistoricalProcessExitReasons"))
         except Exception as e:
             add("exit reasons", False, e)
+        try:
+            for n, ok, d in self._logcheck():
+                add("logpipe: " + n, ok, d)
+        except Exception as e:
+            add("logpipe", False, e)
         self.selfcheck = res
+        try:
+            self._app_version_check(res)
+        except Exception as e:
+            self.ev(f"app version check: {e}")
         self._log("SELFCHECK ok=%d total=%d failed=%s" % (sum(1 for _, ok, _ in res if ok), len(res),
                                                           ",".join(n.replace(" ", "_") for n, ok, _ in res if not ok) or "-"))
         self._log("HOOKS " + " ".join(f"{k.replace(' ', '_')}={v[0]}" for k, v in sorted(self.hook_status.items())))
@@ -2604,6 +3063,96 @@ class StallDoctorPlugin(BasePlugin):
             self._rlang = None
             self.ev(self.t("e_selfcheck", x=", ".join(bad)))
         return res
+
+    def _logcheck(self):
+        """Сквозная проверка конвейера журнала: пишем тестовые строки, читаем их через logcat и прогоняем через
+        настоящий разбор (приёмник sink не трогает ни список проблем, ни курсор журнала)."""
+        res = []
+
+        def add(name, ok, detail=""):
+            res.append((name, bool(ok), str(detail)))
+
+        mark = "sdchk%d" % int(time.time() * 1000)
+        tb_tag = "sdchk_tb"
+        try:
+            Log = jclass("android.util.Log")
+            Log.e("plugin.sdchk", "marker " + mark)
+            Log.w(tb_tag, "Traceback (most recent call last):")
+            Log.w(tb_tag, '  File "/data/user/0/x/files/plugins/sdchk_probe.py", line 7, in run')
+            Log.w(tb_tag, "ValueError: " + mark)
+            add("write to log", True)
+        except Exception as e:
+            add("write to log", False, e)
+            return res
+        self.stop.wait(1.5)
+        lines = [ln for ln in self._read_logcat(1500) if "sdchk" in ln]
+        mine = next((ln for ln in lines if mark in ln), "")
+        add("logcat returns our line", bool(mine), f"{len(lines)} lines")
+        add("line format (threadtime) recognised", bool(mine and LOG_RE.match(mine)), short(mine, 110))
+        got = []
+
+        def sink(kind, plugins, summary, detail, epoch, pkgs=(), unique=False, extra=None):
+            got.append((kind, list(plugins or []), str(summary)))
+
+        try:
+            self._parse_log(lines, {"sdchk_probe", "sdchk"}, sink)
+        except Exception as e:
+            add("parser runs", False, e)
+            return res
+        add("error line with tag plugin.* becomes an issue",
+            any(k == "plugin_log" and p == ["sdchk"] for k, p, _ in got), len(got))
+        add("Python Traceback parsed, plugin named from file path",
+            any(k == "pytrace" and p == ["sdchk_probe"] and mark in sm for k, p, sm in got),
+            "; ".join(f"{k}:{','.join(p)}" for k, p, _ in got)[:100])
+        return res
+
+    def _act_logcheck(self):
+        self._rlang = None
+        BulletinHelper.show_info(self.t("logchk_busy"))
+
+        def work():
+            res = self._logcheck()
+            self._rlang = None
+            text = "\n".join(("OK    " if ok else "FAIL  ") + n + (f": {short(d, 120)}" if d else "") for n, ok, d in res)
+            title = self.t("logchk_title")
+            run_on_ui_thread(lambda: self._dialog(title, text))
+
+        threading.Thread(target=self._safe, args=(work,), name="StallDoctorLogCheck", daemon=True).start()
+
+    # ---------- смена версии приложения ----------
+
+    @staticmethod
+    def _app_ver():
+        try:
+            bv = jclass("org.telegram.messenger.BuildVars")
+            return f"{bv.BUILD_VERSION_STRING} ({bv.BUILD_VERSION})"
+        except Exception as e:
+            _swallow(e)
+            return None
+
+    def _app_version_check(self, res):
+        """Запоминает версию приложения и то, что в ней находилось. После обновления пишет, что перестало находиться."""
+        cur = self._app_ver()
+        if not cur:
+            return
+        ok_names = sorted(n for n, ok, _ in res if ok and not n.startswith(("hook ", "logpipe")))
+        prev = self._jget("app_ver", None)
+        if isinstance(prev, dict) and prev.get("app") and prev["app"] != cur:
+            failed = {n for n, ok, _ in res if not ok}
+            lost = [n for n in prev.get("ok", []) if n in failed]
+            self._jset("app_change", {"t": time.time(), "a": prev["app"], "b": cur, "lost": lost[:15]})
+            self._rlang = None
+            self.ev(self.t("e_app_changed", a=prev["app"], b=cur))
+        self._jset("app_ver", {"app": cur, "ok": ok_names, "sd": __version__})
+
+    def _app_change_lines(self):
+        ch = self._jget("app_change", None)
+        if not isinstance(ch, dict) or time.time() - float(ch.get("t", 0)) > 14 * 86400:
+            return []
+        t = self.t
+        out = [t("app_chg_line", t=time.strftime("%m-%d %H:%M", time.localtime(float(ch.get("t", 0)))), a=ch.get("a"), b=ch.get("b"))]
+        out.append(t("app_chg_lost", x=", ".join(ch["lost"])) if ch.get("lost") else t("app_chg_ok"))
+        return out + [""]
 
     def _bg_selfcheck(self):
         if self.stop.wait(20):
@@ -2614,9 +3163,10 @@ class StallDoctorPlugin(BasePlugin):
             self.ev(f"selfcheck: {e}")
 
     def _selfcheck_lines(self):
+        head = self._app_change_lines()
         if not self.selfcheck:
-            return [self.t("selfcheck_wait")]
-        return [("OK    " if ok else "FAIL  ") + n + (f": {short(d, 120)}" if d else "") for n, ok, d in self.selfcheck]
+            return head + [self.t("selfcheck_wait")]
+        return head + [("OK    " if ok else "FAIL  ") + n + (f": {short(d, 120)}" if d else "") for n, ok, d in self.selfcheck]
 
     def _act_selfcheck(self):
         self._rlang = None
@@ -2642,8 +3192,8 @@ class StallDoctorPlugin(BasePlugin):
                 while it.hasNext() and len(res) < limit:
                     res.append((None, it.next()))
                 return "coll", res
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
         return None, res
 
     @staticmethod
@@ -2656,16 +3206,16 @@ class StallDoctorPlugin(BasePlugin):
                         v = v()
                     if v is not None:
                         return v
-                except Exception:
-                    pass
+                except Exception as _e:
+                    _swallow(_e)
             try:
                 f = obj.getClass().getDeclaredField(n)
                 f.setAccessible(True)
                 v = f.get(obj)
                 if v is not None:
                     return v
-            except Exception:
-                pass
+            except Exception as _e:
+                _swallow(_e)
         return None
 
     def _hook_owner(self, obj):
@@ -2770,8 +3320,8 @@ class StallDoctorPlugin(BasePlugin):
                         if v is not None and hasattr(v, "size"):
                             try:
                                 sz = f" size={v.size()}"
-                            except Exception:
-                                pass
+                            except Exception as _e:
+                                _swallow(_e)
                         val = " = " + short(v, 100) + sz
                     except Exception:
                         val = " = ?"
@@ -2842,8 +3392,8 @@ class StallDoctorPlugin(BasePlugin):
         for old in self._dumps()[:-3]:
             try:
                 os.remove(old)
-            except Exception:
-                pass
+            except Exception as _e:
+                _swallow(_e)
         msg = self.t("dump_done", f=os.path.basename(path), n=hookish)
         self.ev(msg)
         run_on_ui_thread(lambda: self._dialog(self.t("dump"), msg))
@@ -2961,8 +3511,8 @@ class StallDoctorPlugin(BasePlugin):
             if not done.is_set():
                 try:
                     cfg.setPluginsEngine(True)
-                except Exception:
-                    pass
+                except Exception as _e:
+                    _swallow(_e)
                 restart()
 
         self._before_recovery("reload")
@@ -2993,7 +3543,7 @@ class StallDoctorPlugin(BasePlugin):
         if not isinstance(log, list):
             log = []
         log.append({"t": now, "a": pend.get("action"), "ok": bool(helped), "s": pend.get("state")})
-        self._jset("recovery_log", log[-12:])
+        self._jset("recovery_log", log[-30:])
         self._rlang = None
         action = self.t("act_" + str(pend.get("action")))
         res = self.t("rec_yes" if helped else "rec_no")
@@ -3009,6 +3559,20 @@ class StallDoctorPlugin(BasePlugin):
             n, h = agg.get(a, (0, 0))
             agg[a] = (n + 1, h + (1 if e.get("ok") else 0))
         return agg
+
+    def _recovery_verdict(self):
+        """Правило из справочника: помогает перезагрузка плагинов, виновата живая логика плагина; помогает только
+        полный перезапуск, застрявшее состояние в клиенте. Нужно минимум по 2 попытки каждого способа."""
+        agg = self._recovery_stats()
+        r, s2 = agg.get("reload"), agg.get("restart")
+        if not r or not s2 or r[0] < 2 or s2[0] < 2:
+            return None
+        rr, sr = r[1] / r[0], s2[1] / s2[0]
+        if rr >= 0.6:
+            return self.t("v_rec_reload", h=r[1], n=r[0])
+        if rr <= 0.3 and sr >= 0.6:
+            return self.t("v_rec_restart", h=r[1], n=r[0], h2=s2[1], n2=s2[0])
+        return None
 
     def _recovery_summary(self):
         agg = self._recovery_stats()
@@ -3136,8 +3700,8 @@ class StallDoctorPlugin(BasePlugin):
         out = [t("pr_head", v=__version__, p=pid, ts=time.strftime("%Y-%m-%d %H:%M:%S"))]
         try:
             out.append(t("r_app", b=str(jclass("org.telegram.messenger.BuildVars").BUILD_VERSION_STRING), a=self._acc()))
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
         found = False
         info = next((p for p in self._plugins_info() if str(p.get("id")) == pid), None)
         if info:
@@ -3271,6 +3835,7 @@ class StallDoctorPlugin(BasePlugin):
         if not infos:
             return
         cur = {str(p["id"]): [str(p["version"]), bool(p["enabled"])] for p in infos if p.get("id")}
+        by_id = {str(p["id"]): p for p in infos if p.get("id")}
         prev = self._jget("plugin_snapshot", None)
         self._jset("plugin_snapshot", cur)
         if not isinstance(prev, dict):
@@ -3287,7 +3852,13 @@ class StallDoctorPlugin(BasePlugin):
             elif o[0] != v:
                 changes.append({"t": now, "id": pid, "k": "updated", "a": o[0], "b": v})
             elif o[1] != en and not bisecting:
-                changes.append({"t": now, "id": pid, "k": "enabled" if en else "disabled"})
+                ch = {"t": now, "id": pid, "k": "enabled" if en else "disabled"}
+                info = by_id.get(pid) or {}
+                own = now - self.own_toggle.get(pid, 0) < 900       # выключали мы сами (кнопка, деление пополам)
+                if not en and not own and (info.get("error") or info.get("not_responding")):
+                    ch["k"] = "sysdisabled"
+                    ch["e"] = short(str(info.get("error") or "not responding"), 120)
+                changes.append(ch)
         for pid in prev:
             if pid not in cur and pid != "stall_doctor":
                 changes.append({"t": now, "id": pid, "k": "removed"})
@@ -3304,6 +3875,8 @@ class StallDoctorPlugin(BasePlugin):
     def _chg_text(self, c):
         if c.get("k") == "updated":
             return self.t("chg_updated", a=c.get("a"), b=c.get("b"))
+        if c.get("k") == "sysdisabled":
+            return self.t("chg_sysdisabled", e=c.get("e", ""))
         return self.t("chg_" + str(c.get("k")))
 
     def _changes_lines(self, window, limit=15):
@@ -3332,8 +3905,8 @@ class StallDoctorPlugin(BasePlugin):
                 def didReceivedNotification(self_o, id, account, args):
                     try:
                         doctor._on_conn_event(int(account))
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        _swallow(_e)
 
             self.obs = ConnObserver()
             self.obs_acc = self._acc()
@@ -3445,6 +4018,8 @@ class StallDoctorPlugin(BasePlugin):
     def _episode_end(self, now):
         if self.ep_cur:
             self._episode_update(self.ep_cur["t0"], dur=int(now - self.ep_cur["t0"]), open=False)
+            self.ep_prev = self.ep_cur
+            self.ep_prev_end = now
             self.ep_cur = None
 
     def _episode_mark_recovery(self, text):
@@ -3526,6 +4101,10 @@ class StallDoctorPlugin(BasePlugin):
     # ---------- деление пополам ----------
 
     def _plugin_set_enabled(self, pid, flag):
+        try:
+            self.own_toggle[pid] = time.time()
+        except Exception as e:
+            _swallow(e)
         ctl = jclass("com.exteragram.messenger.plugins.PluginsController").getInstance()
         try:
             ctl.setPluginEnabled(pid, bool(flag), None)
@@ -3660,22 +4239,22 @@ class StallDoctorPlugin(BasePlugin):
             try:
                 arr = build.SUPPORTED_ABIS
                 abis = ", ".join(str(arr[i]) for i in range(len(arr)))
-            except Exception:
-                pass
+            except Exception as _e:
+                _swallow(_e)
             out.append(f"Android {ver.RELEASE} (API {ver.SDK_INT}) · {build.MANUFACTURER} {build.MODEL} · {abis}")
         except Exception as e:
             out.append(f"android: {e}")
         try:
             bv = jclass("org.telegram.messenger.BuildVars")
             out.append(f"App: {bv.BUILD_VERSION_STRING} ({bv.BUILD_VERSION})")
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
         sdk = None
         try:
             eng = find_class("com.exteragram.messenger.plugins.PythonPluginsEngine")
             sdk = getattr(eng, "SDK_VERSION", None)
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
         out.append(f"Plugin SDK: {sdk if sdk is not None else '?'} · Python {sys.version.split()[0]} · Stall Doctor {__version__}")
         try:
             ctx = jclass("org.telegram.messenger.ApplicationLoader").applicationContext
@@ -3687,21 +4266,21 @@ class StallDoctorPlugin(BasePlugin):
             try:
                 ds = int(ctx.getSystemService("connectivity").getRestrictBackgroundStatus())
                 out.append(t("env_datasaver", v={1: t("no"), 2: t("env_ds_white"), 3: t("yes")}.get(ds, "?")))
-            except Exception:
-                pass
-        except Exception:
-            pass
+            except Exception as _e:
+                _swallow(_e)
+        except Exception as _e:
+            _swallow(_e)
         try:
             st = os.statvfs(self.base_dir)
             out.append(t("env_free", m=(st.f_bavail * st.f_frsize) >> 20))
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
         try:
             cfg = jclass("com.exteragram.messenger.ExteraConfig")
             out.append(t("env_safe", v=yn(bool(cfg.getPluginsSafeMode()))))
             out.append(t("env_engine", v=yn(bool(cfg.getPluginsEngine()))))
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
         out.extend(self._notif_lines())
         pl = self._proc_line()
         if pl:
@@ -3718,18 +4297,18 @@ class StallDoctorPlugin(BasePlugin):
             free = (st.f_bavail * st.f_frsize) >> 20
             if free < 300:
                 self._add_issue("storage", [], self.t("i_storage", m=free), [], now)
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
         try:
             cfg = jclass("com.exteragram.messenger.ExteraConfig")
             if bool(cfg.getPluginsSafeMode()):
                 self._add_issue("safemode", [], self.t("i_safemode"), [], now, unique=True)
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
         try:
             self._notif_issues(now)
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
 
     def _res_sample(self, now, cur):
         try:
@@ -3769,15 +4348,24 @@ class StallDoctorPlugin(BasePlugin):
         me = threading.get_ident()
         frames = sys._current_frames()
         cnt = {}
+        det = {}
+        where = lambda f: f"{os.path.basename(f.filename)}:{f.lineno} {f.name}" if f else "?"
         for th in threading.enumerate():
             if th.ident == me or th.name.startswith("StallDoctor"):
                 continue
             fr = frames.get(th.ident)
             if fr is None:
                 continue
-            text = " ".join(f.filename for f in traceback.extract_stack(fr))
+            st = traceback.extract_stack(fr)
+            text = " ".join(f.filename for f in st)
             for pid in self._plugins_from_paths(text, ids):
                 cnt[pid] = cnt.get(pid, 0) + 1
+                try:
+                    own = next((f for f in reversed(st) if pid in f.filename), None)
+                    key = (re.sub(r"\d+", "#", th.name) or "?", where(own), where(st[-1] if st else None))
+                    det.setdefault(pid, collections.Counter())[key] += 1
+                except Exception as _e:
+                    _swallow(_e)
         self.pyth_hist.append(cnt)
         h = list(self.pyth_hist)
         if len(h) < 4:
@@ -3785,7 +4373,10 @@ class StallDoctorPlugin(BasePlugin):
         for pid in cnt:
             series = [x.get(pid, 0) for x in h[-4:]]
             if series[-1] >= 10 and series[-1] - series[0] >= 6 and all(b >= a for a, b in zip(series, series[1:])):
-                self._add_issue("pythreads", [pid], self.t("i_pythreads", a=series[0], b=series[-1]), [], now)
+                lines = [self.t("d_pyth_series", x=" → ".join(str(x) for x in series))]
+                for (nm, own, last), n in det.get(pid, collections.Counter()).most_common(6):
+                    lines.append(self.t("d_pythread", n=n, name=nm, own=own, last=last))
+                self._add_issue("pythreads", [pid], self.t("i_pythreads", a=series[0], b=series[-1]), lines, now)
 
     # ---------- защита собственных частей ----------
 
@@ -3826,14 +4417,19 @@ class StallDoctorPlugin(BasePlugin):
                 try:
                     size += os.path.getsize(os.path.join(self.base_dir, fn))
                     files += 1
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as _e:
+                    _swallow(_e)
+        except Exception as _e:
+            _swallow(_e)
         out.append(t("sc_disk", k=size >> 10, n=files))
         keys = set(INTERNAL_KEYS) | {"plugin_snapshot", "plugin_changes", "episodes", "bisect"}
         state = sum(len(str(self.get_setting(k, "") or "")) for k in keys)
         out.append(t("sc_state", k=state >> 10))
+        sw = sorted(_SWALLOWED.items(), key=lambda kv: -kv[1][0])
+        if sw:
+            out.append(t("sc_swallow", n=sum(v[0] for _, v in sw), k=len(sw)))
+            for key, (cnt, last, ts) in sw[:6]:
+                out.append(f"    {key} ×{cnt}: {last}")
         return out
 
     def _act_selfcost(self):
@@ -3924,8 +4520,8 @@ class StallDoctorPlugin(BasePlugin):
                 while q and now - q[0] > 120:
                     q.popleft()
                 q.append(now)
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
         return HookResult()
 
     def post_request_hook(self, request_name, account, response, error):
@@ -3936,8 +4532,8 @@ class StallDoctorPlugin(BasePlugin):
                 if q:
                     now = time.time()
                     self.ops.setdefault(request_name, collections.deque(maxlen=200)).append((now, now - q.popleft(), bool(error)))
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
         return HookResult()
 
     def _ops_lines(self):
@@ -3975,32 +4571,32 @@ class StallDoctorPlugin(BasePlugin):
             nm = ctx.getSystemService("notification")
             try:
                 info["enabled"] = bool(nm.areNotificationsEnabled())
-            except Exception:
-                pass
+            except Exception as _e:
+                _swallow(_e)
             try:
                 chans = nm.getNotificationChannels()
                 info["blocked"] = [str(chans.get(i).getId()) for i in range(chans.size()) if int(chans.get(i).getImportance()) == 0]
-            except Exception:
-                pass
+            except Exception as _e:
+                _swallow(_e)
             try:
                 info["dnd"] = int(nm.getCurrentInterruptionFilter())
-            except Exception:
-                pass
-        except Exception:
-            pass
+            except Exception as _e:
+                _swallow(_e)
+        except Exception as _e:
+            _swallow(_e)
         try:
             info["bucket"] = int(ctx.getSystemService("usagestats").getAppStandbyBucket())
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
         try:
             info["bgrestr"] = bool(ctx.getSystemService("activity").isBackgroundRestricted())
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
         try:
             tok = getattr(jclass("org.telegram.messenger.SharedConfig"), "pushString", None)
             info["push"] = bool(tok and len(str(tok)) > 0)
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
         return info
 
     def _notif_lines(self):
@@ -4075,8 +4671,8 @@ class StallDoctorPlugin(BasePlugin):
         try:
             for pid in self._hook_suspects():
                 add(pid, 1, t("rk_hooks"))
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
         cul = self._jget("culprits", {})
         if isinstance(cul, dict):
             for pid, n in cul.items():
@@ -4159,8 +4755,8 @@ class StallDoctorPlugin(BasePlugin):
         for old in self._bundles()[:-3]:
             try:
                 os.remove(old)
-            except Exception:
-                pass
+            except Exception as _e:
+                _swallow(_e)
         self.ev(f"bundle: {os.path.basename(path)}")
         run_on_ui_thread(lambda: self._act_preview(path))
         return path
@@ -4228,57 +4824,34 @@ class StallDoctorPlugin(BasePlugin):
                  on_click=lambda v: self._adv_ok() and threading.Thread(target=self.rescue_now, daemon=True).start()),
         ])
 
-    def _s_health(self, li):
+    def _s_reports(self, li):
         t = self.t
         return self._spaced([
-            Header(text=t("h_checks")),
-            Switch(key="track_changes", text=t("track_changes"), default=True, icon="msg_info"),
-            Switch(key="env_check", text=t("env_check"), default=True, icon="msg_info"),
-            Switch(key="scan_exits", text=t("scan_exits"), default=True, icon="msg_info"),
-            Header(text=t("h_health")),
-            Switch(key="scan_logs", text=t("scan_logs"), default=True, icon="msg_log", subtext=t("scan_logs_sub")),
-            Switch(key="notify_issues", text=t("notify_issues"), default=True, icon="msg_info"),
-            Text(text=t("scan_now"), icon="msg_retry", accent=True, on_click=lambda v: self._act_scan()),
-            Text(text=t("issues"), subtext=t("issues_sub", n=len(self.issues)), icon="msg_list", on_click=lambda v: self._act_issues()),
-            Text(text=t("clr_issues"), icon="msg_delete", on_click=lambda v: self._act_clear_issues()),
+            Header(text=t("h_reports")),
+            Text(text=t("bn_btn"), subtext=t("bn_sub"), icon="msg_share", accent=True, on_click=lambda v: self._act_bundle()),
+            Text(text=t("pr_btn"), subtext=t("pr_btn_sub"), icon="msg_info", create_sub_fragment=lambda *a: self._plugin_pick_items()),
+            Switch(key="auto_send", text=t("auto_send"), default=False, icon="msg_share", subtext=t("auto_send_sub")),
+            Selector(key="report_lang", text=t("report_lang"), default=0, icon="msg_list", items=LANG_ITEMS[li]),
+            Header(text=t("h_hist2")),
+            Text(text=t("ep_btn"), subtext=t("ep_btn_sub"), icon="msg_list", on_click=lambda v: self._act_episodes()),
+            Text(text=t("ep_csv"), icon="msg_copy", on_click=lambda v: self._act_episodes_csv()),
+            Text(text=t("chg_btn"), subtext=t("chg_btn_sub"), icon="msg_list", on_click=lambda v: self._act_changes()),
+            Text(text=t("journal"), icon="msg_log", on_click=lambda v: self._act_journal()),
+            Header(text=t("h_dev")),
             Text(text=t("selfcheck"),
                  subtext=(t("selfcheck_sub", ok=sum(1 for _, ok, _ in self.selfcheck if ok), n=len(self.selfcheck))
                           if self.selfcheck else t("selfcheck_wait")),
                  icon="msg_info", on_click=lambda v: self._act_selfcheck()),
-            Text(text=t("chg_btn"), subtext=t("chg_btn_sub"), icon="msg_list", on_click=lambda v: self._act_changes()),
-        ])
-
-    def _s_reports(self, li):
-        t = self.t
-        return self._spaced([
-            Header(text=t("h_view")),
-            Text(text=t("show"), icon="msg_list", on_click=lambda v: self._act_show()),
-            Text(text=t("ep_btn"), subtext=t("ep_btn_sub"), icon="msg_list", on_click=lambda v: self._act_episodes()),
-            Text(text=t("pr_btn"), subtext=t("pr_btn_sub"), icon="msg_info", create_sub_fragment=lambda *a: self._plugin_pick_items()),
-            Text(text=t("journal"), icon="msg_log", on_click=lambda v: self._act_journal()),
-            Header(text=t("h_share")),
-            Text(text=t("bn_btn"), subtext=t("bn_sub"), icon="msg_share", accent=True, on_click=lambda v: self._act_bundle()),
-            Text(text=t("send"), icon="msg_share", on_click=lambda v: self._act_preview()),
-            Text(text=t("copy_short"), icon="msg_copy", on_click=lambda v: self._act_copy(True)),
-            Text(text=t("copy_full"), icon="msg_copy", on_click=lambda v: self._act_copy(False)),
-            Switch(key="auto_send", text=t("auto_send"), default=False, icon="msg_share", subtext=t("auto_send_sub")),
-            Selector(key="report_lang", text=t("report_lang"), default=0, icon="msg_list", items=LANG_ITEMS[li]),
-            Header(text=t("h_hist")),
-            Text(text=t("ep_csv"), icon="msg_copy", on_click=lambda v: self._act_episodes_csv()),
+            Text(text=t("logchk_btn"), subtext=t("logchk_btn_sub"), icon="msg_log", on_click=lambda v: self._act_logcheck()),
+            Text(text=t("sc_btn"), subtext=t("sc_btn_sub"), icon="msg_info", on_click=lambda v: self._act_selfcost()),
             Text(text=t("dump"), subtext=t("dump_sub"), icon="msg_log", on_click=lambda v: self._act_dump()),
             Text(text=t("dump_send"), icon="msg_share", on_click=lambda v: self._act_send_dump()),
+            Header(text=t("h_data")),
+            Text(text=t("cfg_export"), icon="msg_copy", on_click=lambda v: self._act_cfg_export()),
+            Text(text=t("cfg_import"), icon="msg_copy", on_click=lambda v: self._act_cfg_import()),
             Text(text=t("clear"), icon="msg_delete", red=True, on_click=lambda v: self._act_clear()),
             Divider(text=t("hint_hist")),
         ])
-
-    def _s_more(self, li):
-        t = self.t
-        return [
-            Header(text=t("sec_more")),
-            Text(text=t("sc_btn"), subtext=t("sc_btn_sub"), icon="msg_info", on_click=lambda v: self._act_selfcost()),
-            Text(text=t("cfg_export"), icon="msg_copy", on_click=lambda v: self._act_cfg_export()),
-            Text(text=t("cfg_import"), icon="msg_copy", on_click=lambda v: self._act_cfg_import()),
-        ]
 
     def create_settings(self):
         self._rlang = None
@@ -4289,14 +4862,18 @@ class StallDoctorPlugin(BasePlugin):
         except Exception:
             n = m = 0
         t = self.t
+        self._prune_issues()
+        found = len(self.issues)
         head = [
-            Header(text=t("h_diag")),
+            Header(text=t("h_state")),
             Switch(key="monitor", text=t("monitor"), default=True, icon="msg_info", subtext=t("monitor_sub")),
             Text(text=t("status"), subtext=self.status_text(), icon="msg_info",
                  on_click=lambda v: self.set_setting("ui_refresh", time.time(), reload_settings=True)),
-            Header(text=t("h_quick")),
-            Text(text=t("collect"), icon="msg_retry", accent=True, on_click=lambda v: self._act_manual()),
-            Text(text=t("issues"), subtext=t("issues_sub", n=len(self.issues)), icon="msg_list", on_click=lambda v: self._act_issues()),
+            Header(text=t("h_wrong")),
+            Text(text=t("issues"), subtext=t("issues_sub", n=found) if found else t("issues_sub0"), icon="msg_list",
+                 accent=bool(found), on_click=lambda v: self._act_issues()),
+            Text(text=t("collect"), subtext=t("collect_sub"), icon="msg_retry", on_click=lambda v: self._act_manual()),
+            Text(text=t("last_report"), subtext=t("last_report_sub"), icon="msg_log", on_click=lambda v: self._act_show()),
         ]
         tail = [Divider(), Text(text=t("stats"), subtext=t("stats_sub", n=n, m=m), icon="msg_info"), Divider(text=t("about"))]
         look = [
@@ -4305,20 +4882,18 @@ class StallDoctorPlugin(BasePlugin):
             Switch(key="flat_settings", text=t("flat"), default=False, icon="msg_info", subtext=t("flat_sub")),
         ]
         if self.get_setting("flat_settings", False):
-            return self._spaced(head + self._s_monitor(li) + self._s_errors(li) + self._s_recover(li) + self._s_health(li)
-                                + self._s_reports(li) + self._s_more(li) + look) + tail
+            return self._spaced(head + self._s_monitor(li) + self._s_problems(li) + self._s_recover(li)
+                                + self._s_reports(li) + look) + tail
 
         def page(text, sub, fn, icon):
             return Text(text=text, subtext=sub, icon=icon, create_sub_fragment=lambda *a: fn(li))
 
         return self._spaced(head + [
-            Header(text=t("h_settings_lbl")),
+            Header(text=t("h_tools")),
             page(t("sec_monitor"), t("sec_monitor_sub"), self._s_monitor, "msg_list"),
-            page(t("sec_errors"), t("sec_errors_sub"), self._s_errors, "msg_report"),
+            page(t("sec_problems"), t("sec_problems_sub"), self._s_problems, "msg_report"),
             page(t("sec_recover"), t("sec_recover_sub"), self._s_recover, "msg_retry"),
-            page(t("sec_health"), t("sec_health_sub"), self._s_health, "msg_info"),
             page(t("sec_reports"), t("sec_reports_sub"), self._s_reports, "msg_log"),
-            page(t("sec_more"), t("sec_more_sub"), self._s_more, "msg_settings"),
         ] + look) + tail
 
     # ---------- интерфейс ----------
@@ -4375,31 +4950,225 @@ class StallDoctorPlugin(BasePlugin):
 
     def _act_clear_issues(self):
         self._rlang = None
-        with self.issue_lock:
-            self.issues.clear()
+        self._forget_issues()
         BulletinHelper.show_success(self.t("cleared"))
 
-    def _act_issues(self):
-        self._rlang = None
-        lines = self._issues_text(15)
-        if lines:
-            plugins = []
-            with self.issue_lock:
-                for it in self.issues.values():
-                    for pl in it["plugin"].split(", "):
-                        if pl and pl not in plugins:
-                            plugins.append(pl)
-            msg = "\n".join(lines)
-            with self.issue_lock:
-                texts = " ".join(f"{v['kind']} {v['summary']}" for v in self.issues.values())
-            for marker, key in (("EXCESSIVE", "hint_cpu"), ("ANR", "hint_anr"), ("LOW_MEMORY", "hint_mem")):
-                if marker in texts:
-                    msg += "\n\n" + self.t(key)
-            if plugins:
-                msg += "\n\n" + self.t("v_advice", who=", ".join(plugins[:3]))
+    # ---------- проблемы: объяснение простыми словами и полный отчёт ----------
+
+    def _sorted_issues(self):
+        self._prune_issues()
+        with self.issue_lock:
+            return sorted(self.issues.values(), key=lambda v: (v["plugin"] == "", v["kind"] not in ("crash", "exit", "ui", "pytrace"),
+                                                               -v["count"], -v["epoch"]))
+
+    def _exc_hint(self, it):
+        if it["kind"] not in ("crash", "pytrace", "plugin_log", "hook"):
+            return ""
+        for rx, key in EXC_HINTS:
+            if rx.search(it["summary"]):
+                return self.t("xh_pref") + " " + self.t(key)
+        return ""
+
+    def _explain(self, it):
+        """(что это значит, что делать) для одной проблемы."""
+        t = self.t
+        kind = it["kind"]
+        who = [x for x in it["plugin"].split(", ") if x and x != "stall_doctor"]
+        if kind == "exit":
+            name = it["summary"].split(":", 1)[0].strip()
+            means = t("x_exit_" + name) if ("x_exit_" + name) in STR else t("x_exit")
+            ex = it.get("extra") or {}
+            if "bg" in ex and name == "LOW_MEMORY":
+                means += " " + t("x_exit_bg" if ex["bg"] else "x_exit_fg")
+            if name in ("LOW_MEMORY", "EXCESSIVE_RESOURCE_USAGE"):
+                with self.issue_lock:
+                    rel = [v for v in self.issues.values() if v["kind"] in ("pythreads", "threads", "memtrend", "fd", "memory", "cpu")]
+                names = []
+                for v in rel:
+                    s = (v["plugin"] + ": " if v["plugin"] else "") + t("k_" + v["kind"])
+                    if s not in names:
+                        names.append(s)
+                if names:
+                    means += " " + t("x_related", x="; ".join(names[:3]))
+            todo = [t("a_exit_" + name) if ("a_exit_" + name) in STR else t("a_exit")]
         else:
-            msg = self.t("no_issues")
-        self._dialog(self.t("dlg_issues"), msg)
+            means = t("x_" + kind) if ("x_" + kind) in STR else ""
+            todo = [t("a_" + kind)] if ("a_" + kind) in STR else []
+        hint = self._exc_hint(it)
+        if hint:
+            means += " " + hint
+        if who:
+            todo.append(t("a_who", who=", ".join(who[:3])))
+        elif kind in ATTR_KINDS:
+            todo.append(t("a_np"))
+        return means.strip(), " ".join(todo)
+
+    @staticmethod
+    def _top_culprit(items):
+        for it in items:
+            for p in it["plugin"].split(", "):
+                if p and p != "stall_doctor":
+                    return p
+        return None
+
+    def _issues_dialog_text(self, items, limit=3000, max_items=6):
+        t = self.t
+        out = [t("ir_intro")]
+        used = len(out[0])
+        shown = 0
+        for i, it in enumerate(items[:max_items], 1):
+            means, todo = self._explain(it)
+            block = "\n".join([
+                f"{i}. [{it['plugin'] or t('who_unknown')}] {t('k_' + it['kind'])}",
+                f"{t('ir_what')}: {short(it['summary'], 200).rstrip(': ')}",
+                f"{t('ir_when_l')}: " + t("ir_when", t=time.strftime("%m-%d %H:%M", time.localtime(it["epoch"])), n=it["count"]),
+                f"{t('ir_means')}: {means}",
+                f"{t('ir_todo')}: {todo}",
+            ])
+            if shown and used + len(block) > limit:
+                break
+            out.append(block)
+            used += len(block)
+            shown += 1
+        if len(items) > shown:
+            out.append(t("ir_rest", n=len(items) - shown))
+        return "\n\n".join(out)
+
+    def _issues_report(self):
+        """Полный текст для автора плагина: объяснения, стеки, окружение, список плагинов, журнал событий."""
+        self._rlang = self._report_lang_idx()
+        try:
+            t = self.t
+            items = self._sorted_issues()
+            try:
+                infos = {str(p.get("id")): p for p in self._plugins_info()}
+            except Exception:
+                infos = {}
+            out = [t("ir_title", v=__version__, ts=time.strftime("%Y-%m-%d %H:%M:%S"))]
+            try:
+                out.append(t("r_app", b=str(jclass("org.telegram.messenger.BuildVars").BUILD_VERSION_STRING), a=self._acc()))
+            except Exception as _e:
+                _swallow(_e)
+            out += ["", t("ir_howto"), "", "== " + t("s_env") + " =="] + self._env_lines()
+            out += ["", "== " + t("ir_head_n", n=len(items)) + " =="]
+            if not items:
+                out.append(t("no_issues"))
+            for i, it in enumerate(items, 1):
+                means, todo = self._explain(it)
+                out += ["", f"#{i} [{it['plugin'] or t('who_unknown')}] {t('k_' + it['kind'])}",
+                        f"{t('ir_what')}: {it['summary'].rstrip(': ')}",
+                        f"{t('ir_when_l')}: " + t("ir_when", t=time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(it["epoch"])), n=it["count"]),
+                        f"{t('ir_means')}: {means}",
+                        f"{t('ir_todo')}: {todo}"]
+                for pid in [x for x in it["plugin"].split(", ") if x]:
+                    p = infos.get(pid)
+                    if p:
+                        flag = ""
+                        if p.get("not_responding"):
+                            flag += f" [{t('pl_noresp')}]"
+                        if p.get("error"):
+                            flag += f" [{t('pl_err')}: {short(p['error'], 100)}]"
+                        out.append(t("ir_plugin", p=pid, v=p.get("version"), e=p.get("enabled"), f=flag))
+                if it["detail"]:
+                    out.append(t("ir_details"))
+                    out.extend("    " + d for d in it["detail"][:14])
+            out += ["", "== " + t("s_plugins") + " =="]
+            for p in infos.values():
+                flag = ""
+                if p.get("not_responding"):
+                    flag += f" [{t('pl_noresp')}]"
+                if p.get("error"):
+                    flag += f" [{t('pl_err')}: {short(p['error'], 100)}]"
+                out.append(f"{p.get('id')} v{p.get('version')} enabled={p.get('enabled')}{flag}")
+            out += ["", "== " + t("ir_events") + " =="] + list(self.events)[-40:]
+            return "\n".join(out) + "\n"
+        finally:
+            self._rlang = None
+
+    def _act_copy_issues(self):
+        self._rlang = None
+        BulletinHelper.show_info(self.t("ir_building"))
+
+        def work():
+            text = self._issues_report()
+
+            def done():
+                self._rlang = None
+                copy_to_clipboard(text)
+                BulletinHelper.show_success(self.t("ir_copied"))
+            run_on_ui_thread(done)
+        threading.Thread(target=self._safe, args=(work,), name="StallDoctorIssuesCopy", daemon=True).start()
+
+    def _act_issues(self):
+        try:
+            frag = get_last_fragment()
+            act = frag.getParentActivity() if frag else None
+            if not act:
+                return
+            self._rlang = None
+            t = self.t
+            items = self._sorted_issues()
+            b = AlertDialogBuilder(act)
+            if not items:
+                b.set_title(t("dlg_issues"))
+                b.set_message(t("no_issues") + "\n\n" + t("ir_none_hint"))
+                b.set_positive_button(t("ir_scan"), lambda bld, w: (bld.dismiss(), self._act_scan()))
+                b.set_negative_button(t("ir_close"), lambda bld, w: bld.dismiss())
+            else:
+                culprit = self._top_culprit(items)
+                b.set_title(t("dlg_issues_n", n=len(items)))
+                b.set_message(self._issues_dialog_text(items)[:3500])
+                b.set_positive_button(t("ir_copy"), lambda bld, w: (bld.dismiss(), self._act_copy_issues()))
+                b.set_negative_button(t("ir_close"), lambda bld, w: bld.dismiss())
+                b.set_neutral_button(t("ir_more"), lambda bld, w: (bld.dismiss(), self._issues_more(culprit)))
+            b.show()
+        except Exception as e:
+            self.ev(f"issues dialog: {e}\n{traceback.format_exc()}")
+
+    def _issues_more(self, culprit=None):
+        try:
+            frag = get_last_fragment()
+            act = frag.getParentActivity() if frag else None
+            if not act:
+                return
+            self._rlang = None
+            t = self.t
+            b = AlertDialogBuilder(act)
+            b.set_title(t("ir_more_title"))
+            b.set_message(t("ir_more_msg"))
+            rescan = lambda bld, w: (bld.dismiss(), self._act_scan())
+            clear = lambda bld, w: (bld.dismiss(), self._act_clear_issues())
+            if culprit:
+                label = t("ep_disable", who=short(culprit, 24))
+                b.set_positive_button(label, lambda bld, w: (bld.dismiss(), self._confirm(
+                    label, t("ir_disable_q", who=culprit), lambda: self._err_disable(culprit))))
+                b.set_negative_button(t("ir_clear"), clear)
+                b.set_neutral_button(t("ir_rescan"), rescan)
+            else:
+                b.set_positive_button(t("ir_rescan"), rescan)
+                b.set_negative_button(t("ir_clear"), clear)
+            b.show()
+        except Exception as e:
+            self.ev(f"issues more: {e}")
+
+    def _report_dialog(self, title, body):
+        """Окно отчёта: копировать полный текст, отправить в Избранное (с просмотром) или закрыть."""
+        try:
+            frag = get_last_fragment()
+            act = frag.getParentActivity() if frag else None
+            if not act:
+                return
+            self._rlang = None
+            t = self.t
+            b = AlertDialogBuilder(act)
+            b.set_title(title)
+            b.set_message((t("full_hint") + "\n\n" + body)[:3500])
+            b.set_positive_button(t("ir_copy"), lambda bld, w: (bld.dismiss(), self._act_copy(False)))
+            b.set_negative_button(t("ir_close"), lambda bld, w: bld.dismiss())
+            b.set_neutral_button(t("rp_send"), lambda bld, w: (bld.dismiss(), self._act_preview()))
+            b.show()
+        except Exception as e:
+            self.ev(f"report dialog: {e}")
 
     def _read(self, short_only):
         self._rlang = None
@@ -4414,7 +5183,7 @@ class StallDoctorPlugin(BasePlugin):
         try:
             p, text = self._read(True)
             if text:
-                self._dialog(self.t("dlg_last") + " (" + os.path.basename(p)[7:-10] + ")", text + "\n" + self.t("full_hint"))
+                self._report_dialog(self.t("dlg_last") + " (" + os.path.basename(p)[7:-10] + ")", text)
         except Exception as e:
             self.ev(f"show report: {e}")
 
@@ -4423,6 +5192,7 @@ class StallDoctorPlugin(BasePlugin):
             p, text = self._read(short_only)
             if text:
                 copy_to_clipboard(text)
+                BulletinHelper.show_success(self.t("copied"))
         except Exception as e:
             self.ev(f"copy report: {e}")
 
@@ -4453,8 +5223,7 @@ class StallDoctorPlugin(BasePlugin):
             for p in self._reports() + self._reports(True) + self._dumps() + self._bundles():
                 os.remove(p)
             self.events.clear()
-            with self.issue_lock:
-                self.issues.clear()
+            self._forget_issues()
             try:
                 os.remove(self._journal_path())
             except FileNotFoundError:

@@ -1,93 +1,129 @@
 #!/usr/bin/env python3
-"""Собирает extera-plugins.json (schema 1) из плагинов в plugins/ и проверяет метаданные.
-Метаданные читаются статически через ast, плагин не исполняется.
-Запуск: python3 -I tools/build_index.py [--name "Название"] [--check]"""
-import argparse, ast, hashlib, json, os, re, sys, time
+"""Собирает extera-plugins.json (schema 1) из файлов в plugins/.
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PLUGINS = os.path.join(ROOT, "plugins")
-EXT = (".py", ".plugin")
+Метаданные читаются из самих плагинов без их выполнения (ast, только литералы).
+  python tools/build_index.py           записать extera-plugins.json
+  python tools/build_index.py --check   ничего не писать; код 1, если индекс в репозитории устарел или есть ошибки
+"""
+import argparse
+import ast
+import hashlib
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+PLUGINS = ROOT / "plugins"
+INDEX = ROOT / "extera-plugins.json"
+
+REPO_NAME = "Stall Doctor"
+REPO_AUTHOR = "@Kotenok_Rwka"
+REPO_HOMEPAGE = "https://github.com/Kotenok-Rwka/Stall-doctor-plugin"
+
+MAX_PLUGIN_BYTES = 2 * 1024 * 1024       # лимит файла .plugin по документации exteraGram
+MAX_INDEX_BYTES = 1024 * 1024            # лимит индекса: 1 МиБ
+REQUIRED = ("id", "name", "version", "app_version", "author")
 CATEGORIES = {"appearance", "chats", "media", "privacy", "tools", "integrations", "fun", "libraries"}
-ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_\-]{1,31}$")
-MAX_PLUGIN = 2 * 1024 * 1024
-MAX_INDEX = 1024 * 1024
-FIELDS = {"__id__": "id", "__name__": "name", "__description__": "description", "__author__": "author", "__version__": "version",
-          "__icon__": "icon", "__app_version__": "app_version", "__sdk_version__": "sdk_version",
-          "__requirements__": "requirements", "__category__": "category"}
+EXTS = (".py", ".plugin")
 
 
 def read_meta(path):
-    tree = ast.parse(open(path, encoding="utf-8").read())
+    """Дандер-метаданные верхнего уровня как {id: ..., name: ...}; значения только литералы."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     meta = {}
     for node in tree.body:
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             name = node.targets[0].id
             if name.startswith("__") and name.endswith("__"):
                 try:
-                    meta[name] = ast.literal_eval(node.value)
+                    meta[name.strip("_")] = ast.literal_eval(node.value)
                 except Exception:
-                    meta[name + "!dynamic"] = True
+                    pass
     return meta
 
 
-def build(name):
-    problems, plugins = [], []
-    for fn in sorted(os.listdir(PLUGINS)):
-        if not fn.endswith(EXT):
-            continue
-        path = os.path.join(PLUGINS, fn)
-        data = open(path, "rb").read()
+def version_key(v):
+    """Числовые части версии: 1.10.0 новее 1.9.2, суффиксы вроде -beta игнорируются."""
+    return tuple(int(x) for x in re.findall(r"\d+", str(v).split("-")[0]))
+
+
+def git_date(path):
+    try:
+        out = subprocess.run(["git", "log", "-1", "--format=%cI", "--", str(path.relative_to(ROOT))],
+                             cwd=ROOT, capture_output=True, text=True, timeout=20).stdout.strip()
+        return out or None
+    except Exception:
+        return None
+
+
+def build():
+    errors, entries = [], {}
+    files = sorted(p for p in PLUGINS.iterdir() if p.suffix in EXTS and not p.name.startswith("_"))
+    for path in files:
         meta = read_meta(path)
-        pid = meta.get("__id__")
-        if not isinstance(pid, str) or not ID_RE.match(pid):
-            problems.append(f"{fn}: недопустимый __id__ {pid!r}")
+        miss = [k for k in REQUIRED if not meta.get(k)]
+        if miss:
+            errors.append(f"{path.name}: нет метаданных {', '.join(miss)}")
             continue
-        if os.path.splitext(fn)[0] != pid:
-            problems.append(f"{fn}: имя файла должно совпадать с __id__ ({pid})")
-        for k in meta:
-            if k.endswith("!dynamic"):
-                problems.append(f"{fn}: {k[:-8]} задан не литералом, движок читает метаданные статически")
-        if "__min_version__" in meta:
-            problems.append(f"{fn}: __min_version__ устарел, используйте __app_version__")
-        if not isinstance(meta.get("__name__"), str):
-            problems.append(f"{fn}: нет __name__")
-        if len(data) > MAX_PLUGIN:
-            problems.append(f"{fn}: {len(data)} байт, лимит {MAX_PLUGIN} для .plugin")
-        cats = meta.get("__category__")
-        cats = [cats] if isinstance(cats, str) else (cats or [])
-        if len(cats) > 3 or any(c not in CATEGORIES for c in cats):
-            problems.append(f"{fn}: __category__ допускает до 3 значений из {sorted(CATEGORIES)}")
-        entry = {"id": pid, "name": meta.get("__name__", pid), "version": str(meta.get("__version__", "1.0")),
-                 "file": "plugins/" + fn, "sha256": hashlib.sha256(data).hexdigest(), "size": len(data),
-                 "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(os.path.getmtime(path)))}
-        for key, out in FIELDS.items():
-            if key in meta and out not in entry and out != "category":
-                entry[out] = meta[key]
+        if path.stem != meta["id"]:
+            errors.append(f"{path.name}: имя файла должно быть <__id__>{path.suffix}, а __id__ = {meta['id']!r}")
+        if not version_key(meta["version"]):
+            errors.append(f"{path.name}: версия {meta['version']!r} без числовых частей")
+        data = path.read_bytes()
+        if len(data) > MAX_PLUGIN_BYTES:
+            errors.append(f"{path.name}: {len(data)} байт больше лимита {MAX_PLUGIN_BYTES}")
+        cats = meta.get("category", [])
+        cats = [cats] if isinstance(cats, str) else list(cats)
+        bad = [c for c in cats if c not in CATEGORIES]
+        if bad:
+            errors.append(f"{path.name}: неизвестные категории {bad}")
+        e = {"id": meta["id"], "name": meta["name"], "version": str(meta["version"]),
+             "file": path.relative_to(ROOT).as_posix(),
+             "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
+        for src, dst in (("description", "description"), ("author", "author"), ("icon", "icon"),
+                         ("app_version", "app_version"), ("sdk_version", "sdk_version"), ("requirements", "requirements")):
+            if meta.get(src):
+                e[dst] = meta[src]
         if cats:
-            entry["category"] = cats if len(cats) > 1 else cats[0]
-        plugins.append(entry)
-    index = {"schema": 1, "name": name, "plugins": plugins}
-    raw = json.dumps(index, ensure_ascii=False, indent=2) + "\n"
-    if len(raw.encode("utf-8")) > MAX_INDEX:
-        problems.append("индекс больше 1 МиБ")
-    return raw, problems
+            e["category"] = cats[:3]
+        d = git_date(path)
+        if d:
+            e["updated_at"] = d
+        old = entries.get(e["id"])
+        if old is None or version_key(e["version"]) > version_key(old["version"]):
+            entries[e["id"]] = e      # по одной записи на плагин: текущая версия
+    index = {"schema": 1, "name": REPO_NAME, "author": REPO_AUTHOR, "homepage": REPO_HOMEPAGE,
+             "plugins": [entries[k] for k in sorted(entries)]}
+    text = json.dumps(index, ensure_ascii=False, indent=2) + "\n"
+    if len(text.encode("utf-8")) > MAX_INDEX_BYTES:
+        errors.append("индекс больше 1 МиБ")
+    return text, errors
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("--name", default="Stall Doctor")
-    ap.add_argument("--check", action="store_true", help="только проверить, индекс не писать")
-    args = ap.parse_args()
-    raw, problems = build(args.name)
-    for p in problems:
-        print("ПРОБЛЕМА:", p, file=sys.stderr)
-    if problems:
-        sys.exit(1)
-    if not args.check:
-        with open(os.path.join(ROOT, "extera-plugins.json"), "w", encoding="utf-8") as f:
-            f.write(raw)
-    print("OK: плагинов в индексе:", json.loads(raw)["plugins"].__len__())
+    ap.add_argument("--check", action="store_true")
+    args = ap.parse_args(argv)
+    text, errors = build()
+    for e in errors:
+        print("ОШИБКА:", e, file=sys.stderr)
+    if errors:
+        return 1
+    if args.check:
+        # updated_at зависит от git-истории и в проверку не входит
+        strip = lambda s: re.sub(r'\n\s*"updated_at": "[^"]*",?', "", s)
+        cur = INDEX.read_text(encoding="utf-8") if INDEX.exists() else ""
+        if strip(cur) != strip(text):
+            print("extera-plugins.json устарел: запустите python tools/build_index.py", file=sys.stderr)
+            return 1
+        print("индекс актуален")
+        return 0
+    INDEX.write_text(text, encoding="utf-8")
+    print(f"записано {INDEX.name}: плагинов {len(json.loads(text)['plugins'])}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
